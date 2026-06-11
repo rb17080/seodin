@@ -1,0 +1,6 @@
+# local-only Claude Code settings (machine-specific permissions)
+.claude/settings.local.json
+
+# OS noise
+Thumbs.db
+.DS_Store

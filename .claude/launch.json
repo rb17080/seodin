@@ -1,0 +1,41 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "seodin-font",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["preview/server.js", "5192"],
+      "port": 5192
+    },
+    {
+      "name": "seodin-rm-psi",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["preview/server.js", "5193"],
+      "port": 5193
+    },
+    {
+      "name": "seodin-linkcheck",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["preview/server.js", "5194"],
+      "port": 5194
+    },
+    {
+      "name": "seodin-linkcheck2",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["preview/server.js", "5195"],
+      "port": 5195
+    },
+    {
+      "name": "seodin-alllinks",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["preview/server.js", "5196"],
+      "port": 5196
+    },
+    {
+      "name": "seodin-fixes11",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["preview/server.js", "5197"],
+      "port": 5197
+    }
+  ]
+}

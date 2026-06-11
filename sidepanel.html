@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SEOdin — the Norse god of ranking</title>
+    <link rel="stylesheet" href="sidepanel.css" />
+  </head>
+  <body>
+    <div id="app">
+      <!-- Header / vibrancy bar -->
+      <header id="header">
+        <div class="header-id">
+          <img id="favicon" class="favicon" alt="" />
+          <div class="header-id-text">
+            <span id="page-title" class="page-title">SEOdin</span>
+            <span id="page-url" class="page-url">The Norse god of ranking</span>
+          </div>
+        </div>
+        <div class="header-actions">
+          <button id="theme-toggle" class="toolbar-btn toolbar-btn--icon" title="Toggle light / dark mode"></button>
+          <button id="jsonld-toggle" class="toolbar-btn toolbar-btn--icon is-on"
+                  title="Include raw JSON-LD in the copied report" aria-pressed="true">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none"
+                 stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+                 stroke-linejoin="round" aria-hidden="true">
+              <path d="M8 3c-2 0-3 1-3 3v2c0 1.6-.8 2.6-2 3 1.2.4 2 1.4 2 3v2c0 2 1 3 3 3" />
+              <path d="M16 3c2 0 3 1 3 3v2c0 1.6.8 2.6 2 3-1.2.4-2 1.4-2 3v2c0 2-1 3-3 3" />
+            </svg>
+          </button>
+          <button id="copy-btn" class="toolbar-btn" title="Copy a Markdown audit for an LLM">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none"
+                 stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+                 stroke-linejoin="round" aria-hidden="true">
+              <rect x="9" y="9" width="11" height="11" rx="2" />
+              <path d="M5 15V5a2 2 0 0 1 2-2h10" />
+            </svg>
+            <span>Copy for LLM</span>
+          </button>
+          <div class="menu-wrap">
+            <button id="settings-btn" class="toolbar-btn toolbar-btn--icon"
+                    title="Export &amp; settings" aria-haspopup="true" aria-expanded="false">
+              <svg viewBox="0 0 24 24" width="15" height="15" fill="none"
+                   stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+                   stroke-linejoin="round" aria-hidden="true">
+                <circle cx="12" cy="12" r="3" />
+                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+              </svg>
+            </button>
+          </div>
+          <button id="refresh-btn" class="toolbar-btn toolbar-btn--icon" title="Re-scan the active tab">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none"
+                 stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+                 stroke-linejoin="round" aria-hidden="true">
+              <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+              <path d="M21 3v6h-6" />
+            </svg>
+          </button>
+        </div>
+      </header>
+
+      <!-- Tab bar (populated by JS, data-driven) -->
+      <nav id="tabbar" class="tabbar" role="tablist">
+        <div id="tab-underline" class="tab-underline"></div>
+      </nav>
+
+      <!-- Content -->
+      <main id="content" class="content" role="tabpanel"></main>
+
+      <!-- Toast -->
+      <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    </div>
+
+    <script src="scrape.js"></script>
+    <script src="sidepanel.js"></script>
+  </body>
+</html>
