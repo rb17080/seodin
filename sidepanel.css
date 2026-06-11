@@ -2184,6 +2184,68 @@ body::before {
   font-weight: 700;
 }
 
+/* ============================================================
+   Multi-line inputs (bulk audit, compete, title workshop)
+   ============================================================ */
+.input-area {
+  width: 100%;
+  padding: 8px 12px;
+  font-family: inherit;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text-primary);
+  background: var(--bg-card-inset);
+  border: 0.5px solid var(--hairline);
+  border-radius: var(--radius-control);
+  outline: none;
+  resize: vertical;
+  min-height: 64px;
+  box-sizing: border-box;
+  transition: border-color 150ms ease;
+}
+.input-area:focus {
+  border-color: var(--accent);
+}
+
+/* ============================================================
+   Title workshop rows
+   ============================================================ */
+.tw-row {
+  padding: 7px 0;
+  border-top: 0.5px solid var(--divider);
+}
+.tw-row:first-of-type {
+  border-top: none;
+}
+.tw-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-bottom: 4px;
+}
+.tw-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.tw-bar {
+  flex: 1;
+}
+.tw-px {
+  font-size: 11px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.tw-px.is-green {
+  color: var(--green);
+}
+.tw-px.is-red {
+  color: var(--red);
+}
+
 /* reduce motion */
 @media (prefers-reduced-motion: reduce) {
   * {

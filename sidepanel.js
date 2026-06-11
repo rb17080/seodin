@@ -110,7 +110,7 @@ const VERSION = (() => {
   try {
     return chrome.runtime.getManifest().version;
   } catch {
-    return "1.5";
+    return "1.6";
   }
 })();
 let currentAudit = null;
@@ -425,6 +425,22 @@ function computeHreflangIssues(a) {
         "Every page in an hreflang set must list its own URL, or search engines may ignore the whole set.",
     });
   return issues;
+}
+
+// Unicode-aware meaningful tokens (shared by Compete and SERP X-Ray).
+function tokenizeTerms(text) {
+  const words = (text || "").match(/[\p{L}\p{N}'’]+/gu) || [];
+  const out = [];
+  for (const raw of words) {
+    const w = raw.toLowerCase();
+    if (w.length < 3 || STOPWORDS.has(w) || /^\d+$/.test(w)) continue;
+    out.push(w);
+  }
+  return out;
+}
+
+function isGoogleSerp(url) {
+  return /^https:\/\/www\.google\.[a-z.]{2,12}\/search/i.test(url || "");
 }
 
 /* ============================================================
@@ -1450,6 +1466,24 @@ function computeTriage(a) {
       F.push({ sev: "warning", label: "hreflang: " + iss.label, detail: iss.detail });
   });
 
+  // same-page anchors pointing at ids that don't exist
+  const brokenFrags = (a.links || []).filter((l) => l.fragBroken);
+  if (brokenFrags.length)
+    F.push({
+      sev: "warning",
+      label: `${brokenFrags.length} broken #anchor link${brokenFrags.length > 1 ? "s" : ""}`,
+      detail: "Same-page links whose target id doesn't exist — they silently do nothing.",
+      items: brokenFrags.map((l) => ({ text: l.rawHref || l.href, locator: l.locator })),
+    });
+
+  // intrusive overlay detected at scan time
+  if (a.overlay)
+    F.push({
+      sev: "warning",
+      label: `Large overlay covers ~${a.overlay.coverPct}% of the viewport`,
+      detail: `<${a.overlay.tag}${a.overlay.id ? ` id="${a.overlay.id}"` : ""}> at scan time. Intrusive interstitials are penalized on mobile — legally required cookie consent is exempt.`,
+    });
+
   // canonical vs og:url
   const ogUrl = og["og:url"];
   if (a.canonical && ogUrl) {
@@ -1763,6 +1797,7 @@ function renderTriage(a) {
   out.push(feed);
 
   out.push(renderHistoryList(a));
+  out.push(renderWayback(a));
   return out;
 }
 
@@ -1876,6 +1911,144 @@ function computeReadability(a) {
   };
 }
 
+/* ---- on-device AI read (Chrome's built-in model — Gemini Nano) ---- */
+let aiView = { key: null, status: null, checked: false, loading: false, output: null, error: null };
+
+// Adapter over the two API shapes Chrome has shipped (LanguageModel global,
+// older window.ai.languageModel). Returns: available | downloadable |
+// downloading | unavailable | unsupported.
+async function aiAvailability() {
+  try {
+    if (typeof LanguageModel !== "undefined" && LanguageModel.availability)
+      return await LanguageModel.availability();
+  } catch {}
+  try {
+    if (window.ai && window.ai.languageModel && window.ai.languageModel.capabilities) {
+      const c = await window.ai.languageModel.capabilities();
+      return c.available === "readily"
+        ? "available"
+        : c.available === "after-download"
+        ? "downloadable"
+        : "unavailable";
+    }
+  } catch {}
+  return "unsupported";
+}
+
+async function aiCreateSession(opts) {
+  if (typeof LanguageModel !== "undefined" && LanguageModel.create)
+    return LanguageModel.create(opts);
+  if (window.ai && window.ai.languageModel) return window.ai.languageModel.create(opts);
+  throw new Error("Built-in model API not present.");
+}
+
+function renderAiRead(a) {
+  const key = normalizeUrl(a.url);
+  if (!aiView.checked) {
+    aiView.checked = true;
+    aiAvailability().then((s) => {
+      aiView.status = s;
+      if (panelState === "ready" && currentTabId === "readability") renderActiveTab();
+    });
+  }
+  const st = aiView.status;
+  const statusRow =
+    st == null
+      ? checkRow({ status: "neutral", label: "Checking for Chrome's built-in model…" })
+      : st === "available"
+      ? checkRow({
+          status: "green",
+          label: "On-device model ready",
+          detail: "Gemini Nano is installed — prompts never leave this machine.",
+        })
+      : st === "downloadable" || st === "downloading"
+      ? checkRow({
+          status: "amber",
+          label: "Available after a one-time model download",
+          detail: "First run downloads the model; after that it's local forever.",
+        })
+      : checkRow({
+          status: "neutral",
+          label: "Not available in this browser",
+          detail:
+            "Needs Chrome's built-in AI (recent Chrome + supported hardware). The heuristic score above still works.",
+        });
+
+  const btn = h("button", {
+    class: "linkcheck-run",
+    type: "button",
+    text: "Read this page with on-device AI",
+  });
+  if (st !== "available" && st !== "downloadable" && st !== "downloading") btn.disabled = true;
+  btn.addEventListener("click", async () => {
+    aiView = { ...aiView, key, loading: true, output: null, error: null };
+    renderActiveTab();
+    try {
+      const session = await aiCreateSession({
+        monitor(m) {
+          try {
+            m.addEventListener("downloadprogress", (ev) => {
+              const el = document.getElementById("ai-progress");
+              if (el)
+                el.textContent = `Downloading model… ${Math.round((ev.loaded || 0) * 100)}%`;
+            });
+          } catch {}
+        },
+      });
+      const text = ((a.content && a.content.text) || "").slice(0, 6000);
+      const output = await session.prompt(
+        "You are an SEO content analyst. Using ONLY the page text below, reply in exactly this format:\n\n" +
+          "TOPIC: <one sentence — what this page is about>\n" +
+          "ANSWERS: <up to 5 short bullets — questions this page clearly answers>\n" +
+          "GAPS: <up to 3 short bullets — questions a reader would still have>\n" +
+          "META: <a compelling meta description for it, max 155 characters>\n\n" +
+          "PAGE TITLE: " +
+          (a.title || "(none)") +
+          "\n\nPAGE TEXT:\n" +
+          text
+      );
+      try {
+        if (session.destroy) session.destroy();
+      } catch {}
+      aiView = { ...aiView, key, status: "available", loading: false, output, error: null };
+    } catch (e2) {
+      aiView = {
+        ...aiView,
+        key,
+        loading: false,
+        output: null,
+        error: (e2 && e2.message) || "Model error.",
+      };
+    }
+    renderActiveTab();
+  });
+
+  const bits = [statusRow, btn];
+  if (aiView.key === key) {
+    if (aiView.loading)
+      bits.push(
+        h(
+          "div",
+          { class: "linkcheck-status" },
+          h("span", { class: "linkcheck-spinner" }),
+          h("span", { id: "ai-progress", text: "Thinking locally…" })
+        )
+      );
+    else if (aiView.error)
+      bits.push(checkRow({ status: "amber", label: "Couldn't run the model", detail: aiView.error }));
+    else if (aiView.output) {
+      bits.push(codeBlock(aiView.output, "On-device AI read"));
+      bits.push(
+        h("p", {
+          class: "note",
+          text: "Generated locally by Chrome's built-in Gemini Nano — nothing left this machine. Treat the META line as a draft.",
+        })
+      );
+    }
+  }
+  return card("On-device AI read", { right: pill("local AI") }, ...bits);
+}
+
 function renderReadability(a) {
   const out = [];
   const r = computeReadability(a);
@@ -1927,13 +2100,15 @@ function renderReadability(a) {
     out.push(card(d.label, {}, body));
   });
 
+  out.push(renderAiRead(a));
+
   out.push(
     card(
       null,
       {},
       h("p", {
         class: "note",
-        text: "Heuristic estimate of how cleanly an LLM can read and cite this page — computed locally, not a real model's judgment. Live LLM grading is planned.",
+        text: "The score above is a local heuristic. For an actual model's judgment, use the on-device AI read — it runs entirely inside Chrome.",
       })
     )
   );
@@ -2146,7 +2321,105 @@ function renderKeywordCard(a, content) {
   });
 
   render();
-  return card("Target keyword", { right: pill("coverage") }, input, coverageWrap);
+
+  // related terms (Datamuse — free, keyless word associations; on demand)
+  const relatedWrap = h("div", {});
+  const relBtn = h("button", { class: "linkcheck-run", type: "button", text: "Related terms" });
+  relBtn.addEventListener("click", async () => {
+    const phrase = (keyword.trim() || content.topGuess || "").trim();
+    if (!phrase) {
+      showToast("Type a keyword first");
+      return;
+    }
+    relBtn.disabled = true;
+    relatedWrap.textContent = "Fetching related terms…";
+    try {
+      const res = await fetch(
+        "https://api.datamuse.com/words?max=18&ml=" + encodeURIComponent(phrase)
+      );
+      const list = await res.json();
+      relatedWrap.textContent = "";
+      if (!Array.isArray(list) || !list.length) {
+        relatedWrap.appendChild(h("p", { class: "muted", text: "No related terms found." }));
+      } else {
+        const chips = h("div", { class: "type-pills" });
+        list.forEach((w) => {
+          const c = pill(w.word, "accent");
+          c.style.cursor = "pointer";
+          c.title = "Analyze this as the target keyword";
+          c.addEventListener("click", () => {
+            keyword = w.word;
+            input.value = w.word;
+            try {
+              localStorage.setItem("seodin.keyword", keyword);
+            } catch {}
+            render();
+          });
+          chips.appendChild(c);
+        });
+        relatedWrap.appendChild(chips);
+        relatedWrap.appendChild(
+          h("p", {
+            class: "note",
+            text: "Datamuse word associations (free, keyless) — ideas, not search volumes. Click a chip to analyze it.",
+          })
+        );
+      }
+    } catch {
+      relatedWrap.textContent = "";
+      relatedWrap.appendChild(h("p", { class: "muted", text: "Couldn't reach Datamuse." }));
+    }
+    relBtn.disabled = false;
+  });
+
+  return card(
+    "Target keyword",
+    { right: pill("coverage") },
+    input,
+    coverageWrap,
+    relBtn,
+    relatedWrap
+  );
+}
+
+// Question-shaped content — what snippets and AI answers quote most readily.
+function computeQuestions(a) {
+  const out = [];
+  const seen = new Set();
+  const add = (q) => {
+    q = (q || "").replace(/\s+/g, " ").trim();
+    if (q.length < 8 || q.length > 160 || !/\?$/.test(q)) return;
+    const k = q.toLowerCase();
+    if (seen.has(k)) return;
+    seen.add(k);
+    out.push(q);
+  };
+  (a.headings || []).forEach((hd) => {
+    if (/\?\s*$/.test(hd.text || "")) add((hd.text || "").trim());
+  });
+  const text = (a.content && a.content.text) || "";
+  (text.match(/[^.!?。！？]{8,160}\?/g) || []).forEach((s) => add(s.trim()));
+  return out.slice(0, 20);
+}
+
+// Long-sentence + passive-voice heuristics (English-only — gated like Flesch).
+function computeWritingFlags(a, ct) {
+  if (ct.fleschSkipped) return { skipped: true };
+  const text = (a.content && a.content.text) || "";
+  const sentences = text.split(/(?<=[.!?])\s+/).filter((s) => s.trim().length > 8);
+  const PASSIVE_RE = /\b(?:am|is|are|was|were|be|been|being)\s+\w+(?:ed|wn|en)\b/i;
+  let longCount = 0;
+  let passiveCount = 0;
+  const long = [];
+  sentences.forEach((s) => {
+    const wc = (s.match(/[\p{L}\p{N}'’]+/gu) || []).length;
+    if (wc > 28) {
+      longCount++;
+      if (long.length < 8) long.push({ words: wc, text: s.trim().slice(0, 110) });
+    }
+    if (PASSIVE_RE.test(s)) passiveCount++;
+  });
+  return { skipped: false, total: Math.max(1, sentences.length), longCount, long, passiveCount };
 }
 
 function renderContent(a) {
@@ -2258,6 +2531,69 @@ function renderContent(a) {
 
   // target keyword
   out.push(renderKeywordCard(a, ct));
+
+  // questions the page answers (headings + sentences ending in "?")
+  const qs = computeQuestions(a);
+  out.push(
+    card(
+      "Questions answered",
+      { right: qs.length ? pill(String(qs.length)) : null },
+      qs.length
+        ? h(
+            "div",
+            { class: "triage-items", style: { margin: "0" } },
+            qs.map((q) => h("div", { class: "triage-item", text: q }))
+          )
+        : h("p", {
+            class: "muted",
+            text: "No question-shaped content found. Pages that pose and answer real questions are far easier for search features and AI to quote.",
+          }),
+      qs.length
+        ? h("p", {
+            class: "note",
+            text: "Question-shaped content is what featured snippets and AI answers quote most readily.",
+          })
+        : null
+    )
+  );
+
+  // writing flags (English heuristics)
+  const wf = computeWritingFlags(a, ct);
+  if (wf.skipped) {
+    out.push(
+      card(
+        "Writing flags",
+        { right: pill("skipped") },
+        h("p", { class: "muted", text: "English-only heuristics — skipped for this page's language." })
+      )
+    );
+  } else {
+    const wfBody = h("div", {});
+    wfBody.appendChild(
+      checkRow({
+        status: wf.longCount ? "amber" : "green",
+        label: wf.longCount
+          ? `${wf.longCount} long sentence${wf.longCount > 1 ? "s" : ""} (over 28 words)`
+          : "No overlong sentences",
+        detail: wf.longCount ? "Long sentences hurt readability and snippet extraction." : null,
+      })
+    );
+    if (wf.long.length) {
+      const list = h("div", { class: "triage-items" });
+      wf.long.forEach((s) =>
+        list.appendChild(h("div", { class: "triage-item", text: `(${s.words}w) ${s.text}…` }))
+      );
+      wfBody.appendChild(list);
+    }
+    wfBody.appendChild(
+      checkRow({
+        status: wf.passiveCount > wf.total * 0.25 ? "amber" : "green",
+        label: `Passive voice in ~${wf.passiveCount} of ${wf.total} sentences`,
+        detail: "Rough pattern match — treat as a nudge, not a rule.",
+      })
+    );
+    out.push(card("Writing flags", { right: pill("heuristic") }, wfBody));
+  }
 
   return out;
 }
@@ -2701,6 +3037,150 @@ function renderHistoryList(a) {
   return card("Scan history", { right: pill("on this machine") }, details);
 }
 
+/* ---- Wayback time machine (Internet Archive — free public API) ---- */
+let waybackView = { key: null, loading: false, data: null, error: null };
+
+function waybackTs(ts) {
+  const s = String(ts || "");
+  return s.length >= 8 ? `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}` : s;
+}
+
+function renderWayback(a) {
+  const key = normalizeUrl(a.url);
+  const btn = h("button", {
+    class: "linkcheck-run",
+    type: "button",
+    text: waybackView.key === key && waybackView.data ? "Check again" : "Check the Wayback Machine",
+  });
+  btn.addEventListener("click", async () => {
+    waybackView = { key, loading: true, data: null, error: null };
+    renderActiveTab();
+    const cdx = await fetchText(
+      "https://web.archive.org/cdx/search/cdx?output=json&fl=timestamp,statuscode&filter=statuscode:200&collapse=timestamp:6&limit=2000&url=" +
+        encodeURIComponent(a.url),
+      20000
+    );
+    if (!cdx.ok) {
+      waybackView = { key, loading: false, data: null, error: "Couldn't reach the Internet Archive." };
+      renderActiveTab();
+      return;
+    }
+    let rows = [];
+    try {
+      rows = JSON.parse(cdx.text).slice(1); // drop the header row
+    } catch {}
+    if (!rows.length) {
+      waybackView = { key, loading: false, data: { never: true }, error: null };
+      renderActiveTab();
+      return;
+    }
+    const firstTs = rows[0][0];
+    const lastTs = rows[rows.length - 1][0];
+    // `id_` returns the original archived bytes without the Wayback toolbar.
+    const snap = async (ts) => {
+      const r = await fetchText(`https://web.archive.org/web/${ts}id_/${a.url}`, 20000);
+      if (!r.ok) return { ts, failed: true };
+      const raw = parseRawHtml(r.text, a.url);
+      return { ts, title: raw.title, words: raw.wordCount };
+    };
+    const first = await snap(firstTs);
+    const last = lastTs !== firstTs ? await snap(lastTs) : first;
+    waybackView = {
+      key,
+      loading: false,
+      error: null,
+      data: { never: false, count: rows.length, first, last },
+    };
+    renderActiveTab();
+  });
+
+  const bits = [
+    h("p", {
+      class: "note",
+      text: "Asks the Internet Archive how this page looked over time — title and word-count drift since first capture. Free public API, on demand.",
+    }),
+    btn,
+  ];
+  if (waybackView.key === key) {
+    if (waybackView.loading)
+      bits.push(
+        h(
+          "div",
+          { class: "linkcheck-status" },
+          h("span", { class: "linkcheck-spinner" }),
+          h("span", { text: "Digging through the archive…" })
+        )
+      );
+    else if (waybackView.error)
+      bits.push(checkRow({ status: "amber", label: "Archive unreachable", detail: waybackView.error }));
+    else if (waybackView.data) {
+      const d = waybackView.data;
+      if (d.never) {
+        bits.push(
+          checkRow({
+            status: "neutral",
+            label: "Never archived",
+            detail: "The Wayback Machine has no capture of this URL.",
+          })
+        );
+      } else {
+        const rows2 = h("div", {});
+        const snapRow = (label, s) =>
+          rows2.appendChild(
+            checkRow({
+              status: s.failed ? "amber" : "neutral",
+              label: `${label} · ${waybackTs(s.ts)}`,
+              detail: s.failed
+                ? "snapshot fetch failed"
+                : `“${truncate(s.title || "(no title)", 70)}” · ~${s.words} words`,
+            })
+          );
+        snapRow("First capture", d.first);
+        if (d.last.ts !== d.first.ts) snapRow("Latest capture", d.last);
+        const ref = d.last.failed ? d.first : d.last;
+        if (!ref.failed) {
+          const titleChanged = (ref.title || "").trim() !== (a.title || "").trim();
+          rows2.appendChild(
+            checkRow({
+              status: titleChanged ? "amber" : "green",
+              label: titleChanged
+                ? "Title has changed since that capture"
+                : "Title unchanged since that capture",
+              detail: titleChanged ? `then: “${truncate(ref.title || "(none)", 60)}”` : null,
+            })
+          );
+          const nowWords = a.wordCount || 0;
+          if (ref.words) {
+            const delta = Math.round(((nowWords - ref.words) / ref.words) * 100);
+            rows2.appendChild(
+              checkRow({
+                status: delta <= -25 ? "amber" : "neutral",
+                label: `Word count ${delta >= 0 ? "+" : ""}${delta}% vs that capture`,
+                detail:
+                  `${ref.words} then · ${nowWords} now` +
+                  (delta <= -25 ? " — significant content loss is worth investigating" : ""),
+              })
+            );
+          }
+        }
+        rows2.appendChild(
+          checkRow({ status: "neutral", label: `${d.count} captures on file`, detail: "monthly-collapsed count" })
+        );
+        bits.push(rows2);
+        bits.push(
+          h(
+            "div",
+            { style: { display: "flex", gap: "8px", flexWrap: "wrap" } },
+            linkButton("View first capture", `https://web.archive.org/web/${d.first.ts}/${a.url}`),
+            linkButton("View latest capture", `https://web.archive.org/web/${d.last.ts}/${a.url}`)
+          )
+        );
+      }
+    }
+  }
+  return card("Time machine", { right: pill("Wayback · on demand") }, ...bits);
+}
+
 /* ============================================================
    TAB REGISTRY (data-driven — add a tab here, shell untouched)
    ============================================================ */
@@ -2718,6 +3198,8 @@ const TABS = [
   { id: "technical", label: "Technical", render: renderTechnical },
   { id: "server", label: "Server", render: renderServer },
   { id: "site", label: "Site", render: renderSite },
+  { id: "compete", label: "Compete", render: renderCompete },
+  { id: "serp", label: "SERP X-Ray", when: (a) => isGoogleSerp(a.url), count: (a) => (a.serp && a.serp.results && a.serp.results.length ? a.serp.results.length : null), render: renderSerpXray },
   { id: "a11y", label: "Accessibility", count: (a) => computeA11y(a).filter((c) => c.status !== "green").length, render: renderA11y },
 ];
 
@@ -2914,6 +3396,7 @@ function renderLinks(a) {
     return r === "" || r === "#" || /^javascript:/i.test(r);
   };
   const placeholder = links.filter(isPlaceholder).length;
+  const brokenFrag = links.filter((l) => l.fragBroken).length;
 
   out.push(
     card(
@@ -2954,6 +3437,12 @@ function renderLinks(a) {
         : null,
       value: placeholder,
     }),
+    checkRow({
+      status: brokenFrag ? "amber" : "green",
+      label: "Broken #anchor links",
+      detail: brokenFrag ? "Same-page target id doesn't exist." : null,
+      value: brokenFrag,
+    }),
   ];
   out.push(card("Attributes", {}, h("div", {}, relRows)));
 
@@ -2987,6 +3476,7 @@ function renderLinks(a) {
       }
       if (!l.anchor) tags.appendChild(tag("empty", "red"));
       if (isPlaceholder(l)) tags.appendChild(tag("placeholder", "amber"));
+      if (l.fragBroken) tags.appendChild(tag("broken #", "amber"));
       const anchor = l.anchor || "(no anchor text)";
       const el = h(
         "div",
@@ -3600,6 +4090,73 @@ function renderEeat(a) {
   ].filter(Boolean);
 
   out.push(card("Trust Signals", { right: pill("heuristic") }, h("div", {}, rows)));
+
+  // author entity lookup (Wikidata — free public API, on demand)
+  if (e.authorName) {
+    const wWrap = h("div", {});
+    const wBtn = h("button", {
+      class: "linkcheck-run",
+      type: "button",
+      text: `Search Wikidata for “${truncate(e.authorName, 28)}”`,
+    });
+    wBtn.addEventListener("click", async () => {
+      wBtn.disabled = true;
+      wWrap.textContent = "Searching Wikidata…";
+      try {
+        const res = await fetch(
+          "https://www.wikidata.org/w/api.php?action=wbsearchentities&format=json&language=en&origin=*&limit=4&search=" +
+            encodeURIComponent(e.authorName)
+        );
+        const json = await res.json();
+        const hits = (json && json.search) || [];
+        wWrap.textContent = "";
+        if (!hits.length) {
+          wWrap.appendChild(
+            h("p", {
+              class: "muted",
+              text: "No Wikidata entity found — normal for most authors; absence is not a negative signal.",
+            })
+          );
+        } else {
+          hits.forEach((hit) =>
+            wWrap.appendChild(
+              checkRow({
+                status: "green",
+                label: hit.label || hit.id,
+                detail: hit.description || "(no description)",
+              })
+            )
+          );
+          wWrap.appendChild(
+            linkButton(
+              "Open on Wikidata",
+              hits[0].concepturi || "https://www.wikidata.org/wiki/" + hits[0].id
+            )
+          );
+          wWrap.appendChild(
+            h("p", {
+              class: "note",
+              text: "A name match is not proof it's the same person — verify before citing. A recognized entity is a strong E-E-A-T signal.",
+            })
+          );
+        }
+      } catch {
+        wWrap.textContent = "";
+        wWrap.appendChild(h("p", { class: "muted", text: "Couldn't reach Wikidata." }));
+      }
+      wBtn.disabled = false;
+    });
+    out.push(
+      card(
+        "Author entity check",
+        { right: pill("on demand") },
+        h("p", { class: "note", text: "Looks the detected author up in Wikidata (free public API)." }),
+        wBtn,
+        wWrap
+      )
+    );
+  }
+
   out.push(
     card(
       null,
@@ -3622,6 +4179,128 @@ function band(value, good, ni) {
   if (value <= ni) return "amber";
   return "red";
 }
+/* ---- real-world (CrUX) data via Google's free keyless PSI endpoint ---- */
+let psiView = { key: null, loading: false, data: null, error: null };
+
+const PSI_BAND = { FAST: "green", AVERAGE: "amber", SLOW: "red" };
+
+function renderPsi(a) {
+  const key = normalizeUrl(a.url);
+  const btn = h("button", {
+    class: "linkcheck-run",
+    type: "button",
+    text: psiView.key === key && psiView.data ? "Fetch again" : "Fetch real-world data (Google PSI)",
+  });
+  btn.addEventListener("click", async () => {
+    psiView = { key, loading: true, data: null, error: null };
+    renderActiveTab();
+    const res = await fetchText(
+      "https://www.googleapis.com/pagespeedonline/v5/runPagespeed?strategy=mobile&category=performance&url=" +
+        encodeURIComponent(a.url),
+      60000
+    );
+    if (!res.ok) {
+      psiView = {
+        key,
+        loading: false,
+        data: null,
+        error:
+          res.status === 429
+            ? "Rate-limited — the keyless quota is strict. Wait a minute and retry."
+            : res.failed
+            ? res.timeout
+              ? "Timed out — Lighthouse runs take a while; retry."
+              : "Network failure."
+            : `HTTP ${res.status}`,
+      };
+      renderActiveTab();
+      return;
+    }
+    try {
+      const json = JSON.parse(res.text);
+      const le = json.loadingExperience || {};
+      const m = le.metrics || {};
+      const pick = (k) => (m[k] ? { p75: m[k].percentile, cat: m[k].category } : null);
+      psiView = {
+        key,
+        loading: false,
+        error: null,
+        data: {
+          fallback: !!le.origin_fallback,
+          lcp: pick("LARGEST_CONTENTFUL_PAINT_MS"),
+          inp: pick("INTERACTION_TO_NEXT_PAINT"),
+          cls: pick("CUMULATIVE_LAYOUT_SHIFT_SCORE"),
+          score:
+            json.lighthouseResult &&
+            json.lighthouseResult.categories &&
+            json.lighthouseResult.categories.performance &&
+            json.lighthouseResult.categories.performance.score != null
+              ? Math.round(json.lighthouseResult.categories.performance.score * 100)
+              : null,
+        },
+      };
+    } catch {
+      psiView = { key, loading: false, data: null, error: "Unexpected response." };
+    }
+    renderActiveTab();
+  });
+
+  const bits = [
+    h("p", {
+      class: "note",
+      text: "28 days of real Chrome-visitor data (CrUX) plus a Lighthouse lab run — Google's free keyless endpoint. Takes ~15–30 s. This also adds INP, which a single local load can't measure.",
+    }),
+    btn,
+  ];
+  if (psiView.key === key) {
+    if (psiView.loading)
+      bits.push(
+        h(
+          "div",
+          { class: "linkcheck-status" },
+          h("span", { class: "linkcheck-spinner" }),
+          h("span", { text: "Asking Google… Lighthouse is slow, hang tight" })
+        )
+      );
+    else if (psiView.error)
+      bits.push(checkRow({ status: "amber", label: "Couldn't fetch", detail: psiView.error }));
+    else if (psiView.data) {
+      const d = psiView.data;
+      const rows = h("div", {});
+      const row = (label, met, fmt) =>
+        rows.appendChild(
+          checkRow({
+            status: met ? PSI_BAND[met.cat] || "neutral" : "neutral",
+            label,
+            detail: met ? `p75 of real visitors · ${met.cat}` : "not enough field data",
+            value: met ? fmt(met.p75) : "—",
+          })
+        );
+      row("LCP (field)", d.lcp, (v) => fmtMs(v));
+      row("INP (field)", d.inp, (v) => fmtMs(v));
+      row("CLS (field)", d.cls, (v) => (v / 100).toFixed(2));
+      if (d.score != null)
+        rows.appendChild(
+          checkRow({
+            status: scoreBand(d.score),
+            label: "Lighthouse performance (lab, mobile)",
+            value: d.score + "/100",
+          })
+        );
+      if (d.fallback)
+        rows.appendChild(
+          checkRow({
+            status: "neutral",
+            label: "Origin-level data",
+            detail: "Not enough traffic on this exact page — showing whole-site numbers.",
+          })
+        );
+      bits.push(rows);
+    }
+  }
+  return card("Real-world performance", { right: pill("CrUX · on demand") }, ...bits);
+}
+
 function renderPerformance(a) {
   const out = [];
   const p = a.performance || {};
@@ -3662,6 +4341,8 @@ function renderPerformance(a) {
       )
     )
   );
+
+  out.push(renderPsi(a));
 
   // heaviest downloads + third-party share, from this load's resource timing
   const top = a.topResources || [];
@@ -3829,6 +4510,90 @@ function renderSerpPreview(a) {
   );
 }
 
+// A/B titles before publishing — each draft measured against the real cutoff.
+function renderTitleWorkshop(a) {
+  let drafts = "";
+  try {
+    drafts = localStorage.getItem("seodin.titleDrafts") || "";
+  } catch {}
+  const ta = h("textarea", {
+    class: "input-area",
+    rows: "4",
+    placeholder: "One candidate title per line…",
+    "aria-label": "Title candidates",
+    spellcheck: "false",
+  });
+  ta.value = drafts;
+  const list = h("div", {});
+  const renderRows = () => {
+    list.textContent = "";
+    const lines = ta.value
+      .split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .slice(0, 8);
+    if (!lines.length) {
+      list.appendChild(
+        h("p", { class: "muted", text: "Type drafts above — each gets measured against the real cutoff." })
+      );
+      return;
+    }
+    lines.forEach((t) => {
+      const px = estimateTitlePx(t);
+      const fits = px <= TITLE_PX_LIMIT;
+      list.appendChild(
+        h(
+          "div",
+          { class: "tw-row" },
+          h("div", { class: "tw-title", text: t }),
+          h(
+            "div",
+            { class: "tw-meta" },
+            h(
+              "div",
+              { class: "bar tw-bar" },
+              h("div", {
+                class: "bar-fill is-" + (fits ? "green" : "red"),
+                style: { width: Math.min(100, (px / TITLE_PX_LIMIT) * 100) + "%" },
+              })
+            ),
+            h("span", { class: "tw-px is-" + (fits ? "green" : "red"), text: `${px}px` }),
+            tag(fits ? "fits" : "truncates", fits ? "green" : "red")
+          )
+        )
+      );
+    });
+  };
+  let deb = null;
+  ta.addEventListener("input", () => {
+    try {
+      localStorage.setItem("seodin.titleDrafts", ta.value);
+    } catch {}
+    clearTimeout(deb);
+    deb = setTimeout(renderRows, 150);
+  });
+  const useBtn = h("button", { class: "linkcheck-run", type: "button", text: "Insert current title" });
+  useBtn.addEventListener("click", () => {
+    ta.value = (a.title ? a.title + "\n" : "") + ta.value;
+    try {
+      localStorage.setItem("seodin.titleDrafts", ta.value);
+    } catch {}
+    renderRows();
+  });
+  renderRows();
+  return card(
+    "Title workshop",
+    { right: pill("live") },
+    ta,
+    useBtn,
+    list,
+    h("p", {
+      class: "note",
+      text: `Same font metrics as the preview above — limit ~${TITLE_PX_LIMIT}px. Drafts stay on this machine.`,
+    })
+  );
+}
+
 /* ============================================================
    TAB: Technical
    ============================================================ */
@@ -3836,6 +4601,7 @@ function renderTechnical(a) {
   const out = [];
 
   out.push(renderSerpPreview(a));
+  out.push(renderTitleWorkshop(a));
 
   const titlePx = estimateTitlePx(a.title || "");
   const titleStatus =
@@ -3947,7 +4713,7 @@ function renderTechnical(a) {
     )
   );
 
-  // hreflang — sanity lint first, then every entry in a scroll viewport
+  // hreflang — sanity lint, every entry, plus on-demand reciprocity check
   if (a.hreflang && a.hreflang.length) {
     const issueRows = computeHreflangIssues(a).map((iss) =>
       checkRow({ status: iss.status, label: iss.label, detail: iss.detail })
@@ -3955,6 +4721,111 @@ function renderTechnical(a) {
     const rows = a.hreflang.map((hl) =>
       checkRow({ status: "neutral", label: hl.lang, detail: hl.href })
     );
+
+    // reciprocity: fetch each alternate, confirm it links back to this page —
+    // the #1 hreflang failure mode, and one almost nothing free verifies.
+    const recipWrap = h("div", {});
+    const others = [];
+    {
+      const seenH = new Set([normalizeForCompare(a.url)]);
+      (a.hreflang || []).forEach((x) => {
+        if (!x.href) return;
+        const n = normalizeForCompare(x.href);
+        if (seenH.has(n)) return;
+        seenH.add(n);
+        others.push(x);
+      });
+    }
+    let recipBtn = null;
+    if (others.length) {
+      const capped = others.slice(0, 10);
+      recipBtn = h("button", {
+        class: "linkcheck-run",
+        type: "button",
+        text: `Verify return tags (${capped.length})`,
+      });
+      recipBtn.addEventListener("click", async () => {
+        recipBtn.disabled = true;
+        recipWrap.textContent = "";
+        const statusEl = h(
+          "div",
+          { class: "linkcheck-status" },
+          h("span", { class: "linkcheck-spinner" }),
+          h("span", { text: `Checking… 0 / ${capped.length}` })
+        );
+        recipWrap.appendChild(statusEl);
+        const lbl = statusEl.lastChild;
+        let done = 0;
+        const results = await runPool(
+          capped,
+          async (x) => {
+            const res = await fetchText(x.href, 10000);
+            if (!res.ok) return { x, status: "unreachable" };
+            try {
+              const doc = new DOMParser().parseFromString(res.text, "text/html");
+              const back = [...doc.querySelectorAll('link[rel="alternate" i][hreflang]')].some(
+                (l2) => {
+                  try {
+                    return (
+                      normalizeForCompare(new URL(l2.getAttribute("href") || "", x.href).href) ===
+                      normalizeForCompare(a.url)
+                    );
+                  } catch {
+                    return false;
+                  }
+                }
+              );
+              return { x, status: back ? "ok" : "missing" };
+            } catch {
+              return { x, status: "unreachable" };
+            }
+          },
+          4,
+          () => {
+            done++;
+            lbl.textContent = `Checking… ${done} / ${capped.length}`;
+          }
+        );
+        recipWrap.textContent = "";
+        const bad = results.filter((r) => r.status === "missing").length;
+        recipWrap.appendChild(
+          checkRow(
+            bad
+              ? {
+                  status: "red",
+                  label: `${bad} alternate${bad > 1 ? "s" : ""} missing the return tag`,
+                  detail: "Without reciprocal links, search engines may ignore the pair entirely.",
+                }
+              : {
+                  status: "green",
+                  label: "All reachable alternates point back",
+                  detail: "Reciprocity confirmed (raw HTML).",
+                }
+          )
+        );
+        results.forEach((r) =>
+          recipWrap.appendChild(
+            checkRow({
+              status: r.status === "ok" ? "green" : r.status === "missing" ? "red" : "amber",
+              label: r.x.lang,
+              detail:
+                r.status === "ok"
+                  ? "points back"
+                  : r.status === "missing"
+                  ? "no return hreflang to this page"
+                  : "unreachable",
+            })
+          )
+        );
+        if (others.length > capped.length)
+          recipWrap.appendChild(
+            h("p", { class: "note", text: `Checked the first ${capped.length} of ${others.length} alternates.` })
+          );
+        recipBtn.disabled = false;
+        recipBtn.textContent = "Re-verify return tags";
+      });
+    }
+
     out.push(
       card(
         "Hreflang",
@@ -3966,7 +4837,9 @@ function renderTechnical(a) {
               label: "Set looks sane",
               detail: "Self-referencing, x-default present, codes valid, no duplicates.",
             }),
-        h("div", { class: "item-list" }, rows)
+        h("div", { class: "item-list" }, rows),
+        recipBtn,
+        recipWrap
       )
     );
   } else {
@@ -4334,15 +5207,17 @@ function parseRawHtml(html, baseUrl) {
     jsonLdScripts: doc.querySelectorAll('script[type="application/ld+json" i]').length,
     ogTitle: ogMeta("og:title"),
     ogImage: ogMeta("og:image"),
+    imgCount: doc.querySelectorAll("img").length,
     wordCount: 0,
+    text: "",
   };
-  // Word count AFTER removing script/style text, or inline JS inflates it.
+  // Word count + visible-ish text AFTER removing script/style, or inline JS
+  // inflates both (the text feeds the Compete tab's term-gap math).
   try {
     doc.querySelectorAll("script,style,noscript,template").forEach((el) => el.remove());
-    out.wordCount = ((doc.body && doc.body.textContent) || "")
-      .trim()
-      .split(/\s+/)
-      .filter(Boolean).length;
+    const bodyText = ((doc.body && doc.body.textContent) || "").replace(/\s+/g, " ").trim();
+    out.wordCount = bodyText ? bodyText.split(" ").length : 0;
+    out.text = bodyText.slice(0, 60000);
   } catch {}
   return out;
 }
@@ -4758,9 +5633,30 @@ function renderSite(a) {
     )
   );
 
-  if (siteView.key !== key || !siteView.data) return out;
+  out.push(renderBulkCard());
 
-  const pages = siteView.data.pages;
+  if (siteView.key === key && siteView.data)
+    out.push(...siteResultCards(siteView.data.pages, `${siteView.data.crawled} crawled`));
+
+  if (bulkView.data)
+    out.push(...siteResultCards(bulkView.data.pages, `${bulkView.data.crawled} pasted`));
+
+  out.push(
+    card(
+      null,
+      {},
+      h("p", {
+        class: "note",
+        text: "Raw-HTML audits — not a full crawl. JS-injected tags on those pages won't show (open any of them and use the Server tab for that).",
+      })
+    )
+  );
+  return out;
+}
+
+// Shared result renderer for the linked-pages crawl AND the bulk paste audit.
+function siteResultCards(pages, crawledLabel) {
+  const cards = [];
   const an = analyzeSite(pages);
   const sum = h("div", {});
   const sRow = (count, okLabel, badLabel, detail, band) =>
@@ -4820,7 +5716,7 @@ function renderSite(a) {
     "Often intentional — verify.",
     "amber"
   );
-  out.push(card("Cross-page findings", { right: pill(`${siteView.data.crawled} crawled`) }, sum));
+  cards.push(card("Cross-page findings", { right: pill(crawledLabel) }, sum));
 
   // duplicate group details
   [
@@ -4839,7 +5735,7 @@ function renderSite(a) {
         })
       )
     );
-    out.push(card(`Duplicate ${kind} · group ${i + 1}`, {}, body));
+    cards.push(card(`Duplicate ${kind} · group ${i + 1}`, {}, body));
   });
 
   // full page list
@@ -4866,28 +5762,412 @@ function renderSite(a) {
     );
     return { el, text: `${p.title || ""} ${p.url}` };
   });
-  out.push(card("Pages", {}, filterableList(rows, { placeholder: "Filter pages…", noun: "pages" })));
+  cards.push(card("Pages", {}, filterableList(rows, { placeholder: "Filter pages…", noun: "pages" })));
+  return cards;
+}
+
+/* ---- bulk paste audit (any URLs, any site — same analysis) ---- */
+let bulkView = { loading: false, data: null, urls: "" };
+
+function renderBulkCard() {
+  const ta = h("textarea", {
+    class: "input-area",
+    rows: "4",
+    placeholder: "https://example.com/page-1\nhttps://example.com/page-2\n…",
+    "aria-label": "URLs to audit",
+    spellcheck: "false",
+  });
+  if (bulkView.urls) ta.value = bulkView.urls;
+  const progress = h("div", {});
+  const btn = h("button", { class: "linkcheck-run", type: "button", text: "Audit pasted URLs" });
+  btn.addEventListener("click", async () => {
+    const urls = [
+      ...new Set(
+        ta.value
+          .split(/\s+/)
+          .map((s) => s.trim())
+          .filter((s) => /^https?:\/\//i.test(s))
+      ),
+    ].slice(0, 30);
+    if (!urls.length) {
+      showToast("Paste full URLs (https://…)");
+      return;
+    }
+    bulkView = { loading: true, data: null, urls: ta.value };
+    btn.disabled = true;
+    progress.textContent = "";
+    const statusEl = h(
+      "div",
+      { class: "linkcheck-status" },
+      h("span", { class: "linkcheck-spinner" }),
+      h("span", { text: `Auditing… 0 / ${urls.length}` })
+    );
+    progress.appendChild(statusEl);
+    const lbl = statusEl.lastChild;
+    let done = 0;
+    const pages = await runPool(urls, auditUrlLite, 4, () => {
+      done++;
+      lbl.textContent = `Auditing… ${done} / ${urls.length}`;
+    });
+    bulkView = { loading: false, urls: ta.value, data: { pages, crawled: pages.length } };
+    btn.disabled = false;
+    renderActiveTab();
+  });
+  return card(
+    "Bulk audit",
+    { right: pill("paste & go") },
+    h("p", {
+      class: "note",
+      text: "Paste up to 30 URLs (any site, one per line) — same raw-HTML audit and cross-page analysis.",
+    }),
+    ta,
+    btn,
+    progress
+  );
+}
+
+/* ============================================================
+   TAB: Compete — term-gap analysis + page duel vs competitors.
+   Local TF-style math over fetched raw HTML; no APIs.
+   ============================================================ */
+let competeView = { key: null, loading: false, data: null, error: null, urls: "" };
+
+// Terms rivals use meaningfully that this page misses or underuses.
+function computeTermGap(yourText, rivals) {
+  const yours = tokenizeTerms(yourText);
+  const yourFreq = new Map();
+  yours.forEach((w) => yourFreq.set(w, (yourFreq.get(w) || 0) + 1));
+  const yourTotal = Math.max(1, yours.length);
+  const rivalData = rivals.map((r) => {
+    const t = tokenizeTerms(r.text);
+    const f = new Map();
+    t.forEach((w) => f.set(w, (f.get(w) || 0) + 1));
+    return { host: r.host, freq: f, total: Math.max(1, t.length) };
+  });
+  const allTerms = new Set();
+  rivalData.forEach((r) => r.freq.forEach((_, k) => allTerms.add(k)));
+  const need = Math.min(2, rivalData.length);
+  const rows = [];
+  allTerms.forEach((term) => {
+    const present = rivalData.filter((r) => (r.freq.get(term) || 0) >= 2);
+    if (present.length < need) return;
+    const avgDen = present.reduce((s, r) => s + r.freq.get(term) / r.total, 0) / present.length;
+    const theirAvgCount = Math.round(
+      present.reduce((s, r) => s + r.freq.get(term), 0) / present.length
+    );
+    const yourCount = yourFreq.get(term) || 0;
+    if (yourCount === 0)
+      rows.push({ term, kind: "missing", avgDen, rivalsWith: present.length, theirAvgCount, yourCount });
+    else if (yourCount / yourTotal < avgDen * 0.3)
+      rows.push({ term, kind: "underused", avgDen, rivalsWith: present.length, theirAvgCount, yourCount });
+  });
+  rows.sort((x, y) => y.rivalsWith - x.rivalsWith || y.avgDen - x.avgDen);
+  return rows.slice(0, 30);
+}
+
+function rivalCard(a, r) {
+  if (r.error)
+    return card("vs " + (r.host || r.url), {}, checkRow({ status: "red", label: "Unreachable", detail: r.error }));
+  const raw = r.raw;
+  const cmp = (label, mine, theirs, warnIfTheirsBigger) =>
+    checkRow({
+      status: warnIfTheirsBigger && theirs > mine * 1.5 ? "amber" : "neutral",
+      label,
+      detail: `you ${mine} · them ${theirs}`,
+    });
+  return card(
+    "vs " + (r.host || r.url),
+    { right: pill(`${raw.wordCount} words`) },
+    h(
+      "div",
+      {},
+      cmp("Words", a.wordCount || 0, raw.wordCount || 0, true),
+      checkRow({
+        status: "neutral",
+        label: "Their title",
+        detail: `${truncate(raw.title || "(none)", 70)} · ~${estimateTitlePx(raw.title || "")}px`,
+      }),
+      cmp("Description length", a.metaDescriptionLength || 0, (raw.metaDescription || "").length),
+      cmp("H1 count", (a.headings || []).filter((x) => x.level === 1).length, raw.h1Count),
+      cmp(
+        "JSON-LD scripts",
+        a.jsonLdScriptCount != null ? a.jsonLdScriptCount : (a.jsonLd || []).length,
+        raw.jsonLdScripts,
+        true
+      ),
+      cmp("Images", (a.images || []).length, raw.imgCount || 0)
+    ),
+    h("p", {
+      class: "note",
+      text: "Their numbers come from raw server HTML (no JavaScript); yours from the rendered tab.",
+    })
+  );
+}
+
+function renderCompete(a) {
+  const out = [];
+  const key = normalizeUrl(a.url);
+
+  const ta = h("textarea", {
+    class: "input-area",
+    rows: "3",
+    placeholder: "Paste 1–3 competitor URLs (the pages outranking you), one per line…",
+    "aria-label": "Competitor URLs",
+    spellcheck: "false",
+  });
+  if (competeView.key === key && competeView.urls) ta.value = competeView.urls;
+  const btn = h("button", { class: "linkcheck-run", type: "button", text: "Analyze competitors" });
+  btn.addEventListener("click", async () => {
+    const urls = [
+      ...new Set(
+        ta.value
+          .split(/\s+/)
+          .map((s) => s.trim())
+          .filter((s) => /^https?:\/\//i.test(s))
+      ),
+    ].slice(0, 3);
+    if (!urls.length) {
+      showToast("Paste at least one full competitor URL");
+      return;
+    }
+    competeView = { key, loading: true, data: null, error: null, urls: ta.value };
+    renderActiveTab();
+    const rivals = await runPool(
+      urls,
+      async (u) => {
+        const res = await fetchServerView(u);
+        if (!res.ok) return { url: u, host: domainOf(u), error: res.message };
+        return { url: u, host: domainOf(u), raw: parseRawHtml(res.html, res.finalUrl || u) };
+      },
+      3,
+      () => {}
+    );
+    const ok = rivals.filter((r) => !r.error);
+    const gap = ok.length
+      ? computeTermGap(
+          (a.content && a.content.text) || "",
+          ok.map((r) => ({ host: r.host, text: r.raw.text || "" }))
+        )
+      : [];
+    competeView = { key, loading: false, error: null, urls: ta.value, data: { rivals, gap } };
+    renderActiveTab();
+  });
 
   out.push(
     card(
-      null,
-      {},
+      "Competitors",
+      { right: pill("local math") },
       h("p", {
         class: "note",
-        text: "A raw-HTML sample of pages linked from here — not a full crawl. JS-injected tags on those pages won't show (open any of them and use the Server tab for that).",
+        text: "Fetches each competitor's raw HTML and runs the term math locally — which words they all use that you don't. The core of paid content tools, with zero APIs.",
+      }),
+      ta,
+      btn
+    )
+  );
+
+  if (competeView.key !== key) return out;
+  if (competeView.loading) {
+    out.push(
+      card(
+        null,
+        {},
+        h(
+          "div",
+          { class: "linkcheck-status" },
+          h("span", { class: "linkcheck-spinner" }),
+          h("span", { text: "Fetching competitors…" })
+        )
+      )
+    );
+    return out;
+  }
+  if (!competeView.data) return out;
+
+  const { rivals, gap } = competeView.data;
+  const okRivals = rivals.filter((r) => !r.error);
+
+  if (okRivals.length) {
+    const gapBody = h("div", {});
+    if (!gap.length) {
+      gapBody.appendChild(
+        checkRow({
+          status: "green",
+          label: "No meaningful term gaps found",
+          detail: "Your page covers the vocabulary these competitors use.",
+        })
+      );
+    } else {
+      const maxDen = Math.max(...gap.map((g) => g.avgDen));
+      gap.forEach((g) => {
+        gapBody.appendChild(
+          h(
+            "div",
+            { class: "term-row" },
+            h("span", { class: "term-word", text: g.term }),
+            h(
+              "div",
+              { class: "term-bar" },
+              h("div", {
+                class: "term-bar-fill",
+                style: { width: Math.max(6, (g.avgDen / maxDen) * 100) + "%" },
+              })
+            ),
+            h("span", {
+              class: "term-count",
+              text: `${g.rivalsWith}/${okRivals.length} rivals · ~${g.theirAvgCount}× · you ${g.yourCount}×`,
+            }),
+            tag(g.kind, g.kind === "missing" ? "red" : "amber")
+          )
+        );
+      });
+    }
+    out.push(
+      card(
+        "Term gaps",
+        { right: pill(`${gap.length} gap${gap.length === 1 ? "" : "s"}`) },
+        gapBody,
+        h("p", {
+          class: "note",
+          text: "Terms used meaningfully (2+×) by the rivals but missing or underused on your page. Coverage ideas — not stuffing targets.",
+        })
+      )
+    );
+  }
+
+  rivals.forEach((r) => out.push(rivalCard(a, r)));
+  return out;
+}
+
+/* ============================================================
+   TAB: SERP X-Ray — analysis of the Google results page you're
+   on (only appears there). Best-effort: Google's markup shifts.
+   ============================================================ */
+function renderSerpXray(a) {
+  const out = [];
+  const s = a.serp || { query: "", results: [], paa: [], related: [] };
+  out.push(
+    card(
+      "SERP X-Ray",
+      { right: pill("beta") },
+      h("p", {
+        class: "note",
+        text: `Read from the Google results page you're viewing${
+          s.query ? ` for “${truncate(s.query, 50)}”` : ""
+        }. Google's markup shifts constantly — treat as best-effort.`,
       })
     )
   );
+  if (!s.results.length) {
+    out.push(
+      card(
+        "Results",
+        {},
+        h("p", {
+          class: "muted",
+          text: "No organic results captured — unusual layout, or Google changed their markup again.",
+        })
+      )
+    );
+  } else {
+    const pxs = s.results.map((r) => estimateTitlePx(r.title));
+    const avgPx = Math.round(pxs.reduce((x, y) => x + y, 0) / pxs.length);
+    const over = pxs.filter((p2) => p2 > TITLE_PX_LIMIT).length;
+    const words = tokenizeTerms(s.results.map((r) => r.title).join(" "));
+    const freq = new Map();
+    words.forEach((w) => freq.set(w, (freq.get(w) || 0) + 1));
+    const common = [...freq.entries()]
+      .filter(([, c]) => c >= 2)
+      .sort((x, y) => y[1] - x[1])
+      .slice(0, 10);
+
+    out.push(
+      card(
+        "Who ranks",
+        { right: pill(`${s.results.length} results`) },
+        h(
+          "div",
+          { class: "item-list" },
+          s.results.map((r, i) => {
+            const el = h(
+              "div",
+              { class: "item" },
+              h(
+                "div",
+                { class: "item-main" },
+                h("div", { class: "item-primary", text: `${i + 1}. ${r.title}` }),
+                h("div", { class: "item-secondary", text: r.host })
+              ),
+              h(
+                "div",
+                { class: "item-tags" },
+                tag(`~${pxs[i]}px`, pxs[i] > TITLE_PX_LIMIT ? "amber" : "")
+              )
+            );
+            el.style.cursor = "pointer";
+            el.title = "Open this result";
+            el.addEventListener("click", () => chrome.tabs.create({ url: r.url }));
+            return el;
+          })
+        )
+      )
+    );
+    out.push(
+      card(
+        "Title patterns",
+        {},
+        h(
+          "div",
+          {},
+          checkRow({ status: "neutral", label: "Average title width", value: `~${avgPx}px` }),
+          checkRow({
+            status: "neutral",
+            label: "Titles over the cutoff",
+            value: `${over} of ${s.results.length}`,
+          })
+        ),
+        common.length
+          ? h("div", { class: "type-pills" }, common.map(([w, c]) => tag(`${w} · ${c}×`)))
+          : null,
+        h("p", {
+          class: "note",
+          text: "Words appearing in 2+ ranking titles — the vocabulary Google is rewarding for this query.",
+        })
+      )
+    );
+  }
+  if (s.paa.length)
+    out.push(
+      card(
+        "People also ask",
+        { right: pill(String(s.paa.length)) },
+        h(
+          "div",
+          { class: "triage-items", style: { margin: "0" } },
+          s.paa.map((q) => h("div", { class: "triage-item", text: q }))
+        ),
+        h("p", { class: "note", text: "Questions worth answering on your page — copy them into your outline." })
+      )
+    );
+  if (s.related.length)
+    out.push(card("Related searches", {}, h("div", { class: "type-pills" }, s.related.map((t) => tag(t)))));
   return out;
 }
 
 /* ============================================================
    shell: tab bar, content, states
    ============================================================ */
+// Tabs may declare when(audit) — e.g. SERP X-Ray only on a Google results page.
+function visibleTabs() {
+  return TABS.filter((t) => !t.when || (currentAudit && t.when(currentAudit)));
+}
+
 function buildTabBar() {
   // remove old tab buttons (keep underline element)
   [...els.tabbar.querySelectorAll(".tab")].forEach((t) => t.remove());
-  TABS.forEach((t) => {
+  const tabs = visibleTabs();
+  if (!tabs.some((t) => t.id === currentTabId)) currentTabId = tabs[0] ? tabs[0].id : "triage";
+  tabs.forEach((t) => {
     const btn = h("button", {
       class: "tab" + (t.id === currentTabId ? " is-active" : ""),
       role: "tab",
@@ -4937,7 +6217,7 @@ function setActiveTab(id) {
 
 function renderActiveTab() {
   if (panelState !== "ready") return;
-  const tab = TABS.find((t) => t.id === currentTabId) || TABS[0];
+  const tab = visibleTabs().find((t) => t.id === currentTabId) || TABS[0];
   const panel = h("div", { class: "tab-panel" });
   let nodes;
   try {
@@ -5152,6 +6432,9 @@ async function runAudit() {
     updateHeaderFromAudit(currentAudit);
     await applyHistory(currentAudit); // Feature 2 — record + diff (local only)
     if (superseded()) return;
+    // On a Google results page, jump straight to SERP X-Ray — but only from
+    // the default tab, never fighting the user's own tab choice.
+    if (isGoogleSerp(currentAudit.url) && currentTabId === "triage") currentTabId = "serp";
     buildTabBar();
     renderActiveTab();
   } finally {

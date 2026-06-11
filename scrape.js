@@ -152,12 +152,42 @@ function scrapeAudit() {
       if (!anchor) anchor = (a.getAttribute("aria-label") || "").trim();
       if (!anchor) anchor = (a.getAttribute("title") || "").trim();
 
+      // same-page #fragment links whose target id/name doesn't exist — they
+      // look like links but silently do nothing.
+      let fragBroken = false;
+      try {
+        let fragTarget = null;
+        if (rawHref.startsWith("#") && rawHref.length > 1) {
+          fragTarget = rawHref.slice(1);
+        } else if (href) {
+          const u2 = new URL(href);
+          if (
+            u2.hash &&
+            u2.hash.length > 1 &&
+            stripWww(u2.hostname) === stripWww(loc.hostname) &&
+            u2.pathname === loc.pathname
+          )
+            fragTarget = u2.hash.slice(1);
+        }
+        if (fragTarget) {
+          const dec = decodeURIComponent(fragTarget);
+          fragBroken = !(
+            document.getElementById(dec) ||
+            document.getElementsByName(dec).length ||
+            (window.CSS &&
+              CSS.escape &&
+              document.querySelector('a[name="' + CSS.escape(dec) + '"]'))
+          );
+        }
+      } catch {}
+
       links.push({
         href,
         rawHref,
         anchor,
         isInternal,
         protocol,
+        fragBroken,
         rel: (a.getAttribute("rel") || "").trim(),
         region: classifyRegion(a),
         // index + a stable signature (resolved href) so highlightFn survives
@@ -279,6 +309,80 @@ function scrapeAudit() {
       document
         .querySelectorAll("video[src],audio[src],source[src]")
         .forEach((el) => addMixed("media", el.src));
+    }
+
+    // ---------------- intrusive overlay (interstitial heuristic) ----------
+    // A fixed/sticky element covering a large share of the viewport at scan
+    // time. Google penalizes intrusive interstitials on mobile (cookie-consent
+    // notices required by law are exempt — the panel says so).
+    let overlay = null;
+    try {
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      const cand = document.querySelectorAll("div,section,aside,dialog");
+      const n = Math.min(cand.length, 4000);
+      for (let ci = 0; ci < n; ci++) {
+        const el = cand[ci];
+        const st = window.getComputedStyle(el);
+        if (st.position !== "fixed" && st.position !== "sticky") continue;
+        if (st.display === "none" || st.visibility === "hidden") continue;
+        if (parseFloat(st.opacity || "1") < 0.05) continue;
+        const r = el.getBoundingClientRect();
+        const cover =
+          (Math.max(0, Math.min(r.right, vw) - Math.max(r.left, 0)) *
+            Math.max(0, Math.min(r.bottom, vh) - Math.max(r.top, 0))) /
+          (vw * vh);
+        if (cover >= 0.4) {
+          overlay = {
+            coverPct: Math.round(cover * 100),
+            tag: el.tagName.toLowerCase(),
+            id: el.id || null,
+          };
+          break;
+        }
+      }
+    } catch {}
+
+    // ---------------- SERP X-Ray (only on a Google results page) ----------
+    // Best-effort extraction of organic results, People-Also-Ask and related
+    // searches from the SERP the user is viewing. Google's markup is unstable
+    // by design — the panel labels this beta.
+    let serp = null;
+    if (/^www\.google\./i.test(loc.hostname) && loc.pathname === "/search") {
+      serp = { query: "", results: [], paa: [], related: [] };
+      try {
+        serp.query = new URL(loc.href).searchParams.get("q") || "";
+      } catch {}
+      document.querySelectorAll("a h3").forEach((h3) => {
+        if (serp.results.length >= 20) return;
+        const aEl = h3.closest("a");
+        if (!aEl) return;
+        try {
+          const u = new URL(aEl.getAttribute("href") || "", loc.href);
+          if (/(^|\.)google\./i.test(u.hostname)) return;
+          const title = txt(h3);
+          if (!title) return;
+          serp.results.push({ title, url: u.href, host: u.hostname.replace(/^www\./, "") });
+        } catch {}
+      });
+      document.querySelectorAll("[data-q]").forEach((el) => {
+        const q = (el.getAttribute("data-q") || "").trim();
+        if (q && serp.paa.length < 12 && serp.paa.indexOf(q) === -1) serp.paa.push(q);
+      });
+      const NAV_WORDS = /^(images|news|videos|maps|shopping|books|flights|finance|web|more|tools|all|search tools|past hour|past 24 hours|past week|past month|past year|verbatim)$/i;
+      document.querySelectorAll('a[href*="/search?"]').forEach((aEl) => {
+        if (serp.related.length >= 12) return;
+        const t = txt(aEl);
+        if (!t || t.length < 4 || t.length > 60) return;
+        if (/^\d+$/.test(t) || NAV_WORDS.test(t)) return;
+        try {
+          const u = new URL(aEl.getAttribute("href") || "", loc.href);
+          const q = u.searchParams.get("q");
+          if (!q || q === serp.query) return;
+          if (q.toLowerCase() !== t.toLowerCase()) return; // real suggestions echo their text
+          if (serp.related.indexOf(t) === -1) serp.related.push(t);
+        } catch {}
+      });
     }
 
     // ---------------- heaviest resources + third-party share ----------------
@@ -725,6 +829,8 @@ function scrapeAudit() {
         topResources,
         thirdParty,
         mixedContent,
+        overlay,
+        serp,
         // the display the page was measured on (for DPR-aware image checks)
         dpr: window.devicePixelRatio || 1,
         // provenance: executeScript runs in the live page, so this is the
