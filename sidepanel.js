@@ -1942,6 +1942,24 @@ async function aiCreateSession(opts) {
   throw new Error("Built-in model API not present.");
 }
 
+// Parse the strict PRIMARY/SECONDARY/TERTIARY reply format (lenient on noise).
+function parseAiKeywords(text) {
+  const grab = (label) => {
+    const m = String(text || "").match(new RegExp("^\\s*\\**" + label + "\\**\\s*:\\s*(.+)$", "im"));
+    return m
+      ? m[1]
+          .split(/[;,•|]/)
+          .map((s) => s.replace(/^[\s\-*<>]+|[\s.<>*]+$/g, ""))
+          .filter((s) => s && s.length <= 60)
+      : [];
+  };
+  return {
+    primary: grab("PRIMARY").slice(0, 1),
+    secondary: grab("SECONDARY").slice(0, 4),
+    tertiary: grab("TERTIARY").slice(0, 6),
+  };
+}
+
 function renderAiRead(a) {
   const key = normalizeUrl(a.url);
   if (!aiView.checked) {
@@ -2322,9 +2340,81 @@ function renderKeywordCard(a, content) {
 
   render();
 
-  // related terms (Datamuse — free, keyless word associations; on demand)
+  // AI keyword extraction — Gemini Nano reads the page text locally and names
+  // the primary/secondary/tertiary keyphrases. Far better than associations.
+  const aiKwWrap = h("div", {});
+  const aiKwBtn = h("button", {
+    class: "linkcheck-run",
+    type: "button",
+    text: "Find keywords with on-device AI",
+  });
+  aiKwBtn.addEventListener("click", async () => {
+    aiKwBtn.disabled = true;
+    aiKwWrap.textContent = "Reading the page locally…";
+    try {
+      const avail = await aiAvailability();
+      if (avail !== "available" && avail !== "downloadable" && avail !== "downloading")
+        throw new Error("Chrome's built-in model isn't available in this browser.");
+      const session = await aiCreateSession({});
+      const txt = ((a.content && a.content.text) || "").slice(0, 5000);
+      const resp = await session.prompt(
+        "You are an SEO keyword analyst. From the page text below, extract the search keyphrases this page should target. Reply in EXACTLY this format (semicolon-separated, nothing else):\n" +
+          "PRIMARY: <the single main 1-4 word keyphrase>\n" +
+          "SECONDARY: <kp>; <kp>; <kp>\n" +
+          "TERTIARY: <kp>; <kp>; <kp>; <kp>\n\n" +
+          "PAGE TITLE: " +
+          (a.title || "") +
+          "\nPAGE TEXT:\n" +
+          txt
+      );
+      try {
+        if (session.destroy) session.destroy();
+      } catch {}
+      const kws = parseAiKeywords(resp);
+      aiKwWrap.textContent = "";
+      const group = (label, list, variant) => {
+        if (!list.length) return;
+        const chips = h("div", { class: "type-pills" });
+        list.forEach((w) => {
+          const c = pill(w, variant);
+          c.style.cursor = "pointer";
+          c.title = "Analyze this as the target keyword";
+          c.addEventListener("click", () => {
+            keyword = w;
+            input.value = w;
+            try {
+              localStorage.setItem("seodin.keyword", keyword);
+            } catch {}
+            render();
+          });
+          chips.appendChild(c);
+        });
+        aiKwWrap.appendChild(h("p", { class: "note", style: { margin: "8px 0 2px" }, text: label }));
+        aiKwWrap.appendChild(chips);
+      };
+      group("Primary", kws.primary, "accent");
+      group("Secondary", kws.secondary, "accent");
+      group("Tertiary", kws.tertiary, "");
+      if (!kws.primary.length && !kws.secondary.length) {
+        aiKwWrap.appendChild(codeBlock(resp, "Model reply (unparsed)"));
+      } else {
+        aiKwWrap.appendChild(
+          h("p", {
+            class: "note",
+            text: "Extracted locally by Gemini Nano from the page text — click a chip to check its coverage.",
+          })
+        );
+      }
+    } catch (e2) {
+      aiKwWrap.textContent = "";
+      aiKwWrap.appendChild(h("p", { class: "muted", text: (e2 && e2.message) || "Model error." }));
+    }
+    aiKwBtn.disabled = false;
+  });
+
+  // word associations (Datamuse — free, keyless; ideas, not extraction)
   const relatedWrap = h("div", {});
-  const relBtn = h("button", { class: "linkcheck-run", type: "button", text: "Related terms" });
+  const relBtn = h("button", { class: "linkcheck-run", type: "button", text: "Word associations (Datamuse)" });
   relBtn.addEventListener("click", async () => {
     const phrase = (keyword.trim() || content.topGuess || "").trim();
     if (!phrase) {
@@ -2377,6 +2467,8 @@ function renderKeywordCard(a, content) {
     { right: pill("coverage") },
     input,
     coverageWrap,
+    aiKwBtn,
+    aiKwWrap,
     relBtn,
     relatedWrap
   );
@@ -3055,27 +3147,41 @@ function renderWayback(a) {
   btn.addEventListener("click", async () => {
     waybackView = { key, loading: true, data: null, error: null };
     renderActiveTab();
-    const cdx = await fetchText(
-      "https://web.archive.org/cdx/search/cdx?output=json&fl=timestamp,statuscode&filter=statuscode:200&collapse=timestamp:6&limit=2000&url=" +
-        encodeURIComponent(a.url),
-      20000
-    );
-    if (!cdx.ok) {
-      waybackView = { key, loading: false, data: null, error: "Couldn't reach the Internet Archive." };
+    // Two tiny queries (first + last capture) instead of one full-index scan —
+    // heavily archived URLs (Wikipedia!) made the single big query time out.
+    const cdxUrl = (extra) =>
+      "https://web.archive.org/cdx/search/cdx?output=json&fl=timestamp&filter=statuscode:200&url=" +
+      encodeURIComponent(a.url) +
+      extra;
+    const firstRes = await fetchText(cdxUrl("&limit=1"), 30000);
+    if (!firstRes.ok) {
+      waybackView = {
+        key,
+        loading: false,
+        data: null,
+        error: firstRes.timeout
+          ? "The archive timed out — heavily archived URLs can be slow. Try once more."
+          : "Couldn't reach the Internet Archive.",
+      };
       renderActiveTab();
       return;
     }
-    let rows = [];
+    let firstTs = null;
     try {
-      rows = JSON.parse(cdx.text).slice(1); // drop the header row
+      const r1 = JSON.parse(firstRes.text);
+      if (r1.length > 1) firstTs = r1[1][0];
     } catch {}
-    if (!rows.length) {
+    if (!firstTs) {
       waybackView = { key, loading: false, data: { never: true }, error: null };
       renderActiveTab();
       return;
     }
-    const firstTs = rows[0][0];
-    const lastTs = rows[rows.length - 1][0];
+    let lastTs = firstTs;
+    try {
+      const lastRes = await fetchText(cdxUrl("&limit=-1"), 30000);
+      const r2 = JSON.parse(lastRes.text);
+      if (lastRes.ok && r2.length > 1) lastTs = r2[1][0];
+    } catch {}
     // `id_` returns the original archived bytes without the Wayback toolbar.
     const snap = async (ts) => {
       const r = await fetchText(`https://web.archive.org/web/${ts}id_/${a.url}`, 20000);
@@ -3089,7 +3195,7 @@ function renderWayback(a) {
       key,
       loading: false,
       error: null,
-      data: { never: false, count: rows.length, first, last },
+      data: { never: false, first, last },
     };
     renderActiveTab();
   });
@@ -3163,9 +3269,6 @@ function renderWayback(a) {
             );
           }
         }
-        rows2.appendChild(
-          checkRow({ status: "neutral", label: `${d.count} captures on file`, detail: "monthly-collapsed count" })
-        );
         bits.push(rows2);
         bits.push(
           h(
@@ -4191,12 +4294,17 @@ function renderPsi(a) {
     type: "button",
     text: psiView.key === key && psiView.data ? "Fetch again" : "Fetch real-world data (Google PSI)",
   });
-  btn.addEventListener("click", async () => {
+  const run = async () => {
     psiView = { key, loading: true, data: null, error: null };
     renderActiveTab();
+    let psiKey = "";
+    try {
+      psiKey = (localStorage.getItem("seodin.psiKey") || "").trim();
+    } catch {}
     const res = await fetchText(
       "https://www.googleapis.com/pagespeedonline/v5/runPagespeed?strategy=mobile&category=performance&url=" +
-        encodeURIComponent(a.url),
+        encodeURIComponent(a.url) +
+        (psiKey ? "&key=" + encodeURIComponent(psiKey) : ""),
       60000
     );
     if (!res.ok) {
@@ -4205,8 +4313,10 @@ function renderPsi(a) {
         loading: false,
         data: null,
         error:
-          res.status === 429
-            ? "Rate-limited — the keyless quota is strict. Wait a minute and retry."
+          res.status === 429 || res.status === 403
+            ? psiKey
+              ? "Rate-limited even with your key — wait a minute and retry."
+              : "Rate-limited — Google's keyless quota is nearly zero these days. Add a free API key below (stays on this machine)."
             : res.failed
             ? res.timeout
               ? "Timed out — Lighthouse runs take a while; retry."
@@ -4243,7 +4353,8 @@ function renderPsi(a) {
       psiView = { key, loading: false, data: null, error: "Unexpected response." };
     }
     renderActiveTab();
-  });
+  };
+  btn.addEventListener("click", run);
 
   const bits = [
     h("p", {
@@ -4262,9 +4373,38 @@ function renderPsi(a) {
           h("span", { text: "Asking Google… Lighthouse is slow, hang tight" })
         )
       );
-    else if (psiView.error)
+    else if (psiView.error) {
       bits.push(checkRow({ status: "amber", label: "Couldn't fetch", detail: psiView.error }));
-    else if (psiView.data) {
+      if (/rate-limited/i.test(psiView.error)) {
+        const keyInput = h("input", {
+          class: "kw-input",
+          type: "text",
+          placeholder: "Paste a free Google API key…",
+          "aria-label": "Google API key",
+          spellcheck: "false",
+        });
+        try {
+          keyInput.value = localStorage.getItem("seodin.psiKey") || "";
+        } catch {}
+        const saveBtn = h("button", { class: "linkcheck-run", type: "button", text: "Save key & retry" });
+        saveBtn.addEventListener("click", () => {
+          try {
+            localStorage.setItem("seodin.psiKey", keyInput.value.trim());
+          } catch {}
+          run();
+        });
+        bits.push(keyInput, saveBtn);
+        bits.push(
+          h("p", {
+            class: "note",
+            text: "The key is free (25,000 requests/day), takes ~2 minutes to create, and never leaves this machine.",
+          })
+        );
+        bits.push(
+          h("div", {}, linkButton("How to get a free key", "https://developers.google.com/speed/docs/insights/v5/get-started"))
+        );
+      }
+    } else if (psiView.data) {
       const d = psiView.data;
       const rows = h("div", {});
       const row = (label, met, fmt) =>
@@ -4433,6 +4573,16 @@ function renderSerpPreview(a) {
     fav.style.display = "none";
   });
 
+  // live refs — the draft inputs below rewrite these in place
+  const titleEl = h("div", { class: "serp-title", text: titleText });
+  const descSpan = h("span", { text: descText });
+  const descEl = h(
+    "div",
+    { class: "serp-desc" },
+    dateStr ? h("span", { class: "serp-date", text: dateStr + " — " }) : null,
+    descSpan
+  );
+
   // The stage renders at Google's true column width (600px desktop / 360px
   // mobile) with Google's real type sizes, then scales down to fit the panel —
   // so the ellipsis cuts exactly where it cuts in a real result.
@@ -4456,13 +4606,8 @@ function renderSerpPreview(a) {
         h("div", { class: "serp-url", text: serpBreadcrumb(a.url) })
       )
     ),
-    h("div", { class: "serp-title", text: titleText }),
-    h(
-      "div",
-      { class: "serp-desc" },
-      dateStr ? h("span", { class: "serp-date", text: dateStr + " — " }) : null,
-      descText
-    )
+    titleEl,
+    descEl
   );
 
   const wrap = h("div", { class: "serp-wrap" }, stage);
@@ -4492,7 +4637,65 @@ function renderSerpPreview(a) {
     }
   );
 
-  const titlePx = estimateTitlePx(a.title || "");
+  // draft mode — type a title/description and watch the real preview update,
+  // including the genuine pixel cutoff (this replaced the old Title workshop)
+  const draftTitle = h("input", {
+    class: "kw-input",
+    type: "text",
+    placeholder: "Try a different title…",
+    "aria-label": "Draft title",
+    spellcheck: "false",
+  });
+  const draftDesc = h("textarea", {
+    class: "input-area",
+    rows: "2",
+    placeholder: "Try a different meta description…",
+    "aria-label": "Draft meta description",
+    spellcheck: "false",
+  });
+  try {
+    draftTitle.value = localStorage.getItem("seodin.draftTitle") || "";
+    draftDesc.value = localStorage.getItem("seodin.draftDesc") || "";
+  } catch {}
+
+  const fitBar = h("div", { class: "bar-fill is-green", style: { width: "0%" } });
+  const pxLabel = h("span", { class: "tw-px is-green", text: "" });
+  const fitTag = tag("fits", "green");
+  const metaRow = h(
+    "div",
+    { class: "tw-meta" },
+    h("div", { class: "bar tw-bar" }, fitBar),
+    pxLabel,
+    fitTag
+  );
+  const baseNote = h("p", { class: "note" });
+
+  const update = () => {
+    const tDraft = draftTitle.value.trim();
+    const dDraft = draftDesc.value.trim();
+    titleEl.textContent = tDraft || titleText;
+    descSpan.textContent = dDraft || descText;
+    const px = estimateTitlePx(tDraft || a.title || "");
+    const fits = px <= TITLE_PX_LIMIT;
+    fitBar.className = "bar-fill is-" + (fits ? "green" : "red");
+    fitBar.style.width = Math.min(100, (px / TITLE_PX_LIMIT) * 100) + "%";
+    pxLabel.className = "tw-px is-" + (fits ? "green" : "red");
+    pxLabel.textContent = px + "px";
+    fitTag.textContent = fits ? "fits" : "truncates";
+    fitTag.className = "tag tag--" + (fits ? "green" : "red");
+    const dLen = (dDraft || a.metaDescription || "").length;
+    baseNote.textContent = `Title ≈ ${px}px of ~${TITLE_PX_LIMIT}px · description ${dLen} ch (sweet spot 70–160). The cutoff you see above is the real one — Google may still rewrite per query.`;
+    try {
+      localStorage.setItem("seodin.draftTitle", draftTitle.value);
+      localStorage.setItem("seodin.draftDesc", draftDesc.value);
+    } catch {}
+    requestAnimationFrame(fit);
+    setTimeout(fit, 0);
+  };
+  draftTitle.addEventListener("input", update);
+  draftDesc.addEventListener("input", update);
+  update();
+
   return card(
     "Search preview",
     { right: seg },
@@ -4503,96 +4706,15 @@ function renderSerpPreview(a) {
           text: "No meta description — the snippet above is improvised from page text, which is what Google does too.",
         })
       : null,
-    h("p", {
-      class: "note",
-      text: `Title ≈ ${titlePx}px of ~${TITLE_PX_LIMIT}px · description ${a.metaDescriptionLength} ch (sweet spot 70–160). Measured with real font metrics — Google may still rewrite titles and snippets per query.`,
-    })
+    draftTitle,
+    draftDesc,
+    metaRow,
+    baseNote
   );
 }
 
-// A/B titles before publishing — each draft measured against the real cutoff.
-function renderTitleWorkshop(a) {
-  let drafts = "";
-  try {
-    drafts = localStorage.getItem("seodin.titleDrafts") || "";
-  } catch {}
-  const ta = h("textarea", {
-    class: "input-area",
-    rows: "4",
-    placeholder: "One candidate title per line…",
-    "aria-label": "Title candidates",
-    spellcheck: "false",
-  });
-  ta.value = drafts;
-  const list = h("div", {});
-  const renderRows = () => {
-    list.textContent = "";
-    const lines = ta.value
-      .split("\n")
-      .map((s) => s.trim())
-      .filter(Boolean)
-      .slice(0, 8);
-    if (!lines.length) {
-      list.appendChild(
-        h("p", { class: "muted", text: "Type drafts above — each gets measured against the real cutoff." })
-      );
-      return;
-    }
-    lines.forEach((t) => {
-      const px = estimateTitlePx(t);
-      const fits = px <= TITLE_PX_LIMIT;
-      list.appendChild(
-        h(
-          "div",
-          { class: "tw-row" },
-          h("div", { class: "tw-title", text: t }),
-          h(
-            "div",
-            { class: "tw-meta" },
-            h(
-              "div",
-              { class: "bar tw-bar" },
-              h("div", {
-                class: "bar-fill is-" + (fits ? "green" : "red"),
-                style: { width: Math.min(100, (px / TITLE_PX_LIMIT) * 100) + "%" },
-              })
-            ),
-            h("span", { class: "tw-px is-" + (fits ? "green" : "red"), text: `${px}px` }),
-            tag(fits ? "fits" : "truncates", fits ? "green" : "red")
-          )
-        )
-      );
-    });
-  };
-  let deb = null;
-  ta.addEventListener("input", () => {
-    try {
-      localStorage.setItem("seodin.titleDrafts", ta.value);
-    } catch {}
-    clearTimeout(deb);
-    deb = setTimeout(renderRows, 150);
-  });
-  const useBtn = h("button", { class: "linkcheck-run", type: "button", text: "Insert current title" });
-  useBtn.addEventListener("click", () => {
-    ta.value = (a.title ? a.title + "\n" : "") + ta.value;
-    try {
-      localStorage.setItem("seodin.titleDrafts", ta.value);
-    } catch {}
-    renderRows();
-  });
-  renderRows();
-  return card(
-    "Title workshop",
-    { right: pill("live") },
-    ta,
-    useBtn,
-    list,
-    h("p", {
-      class: "note",
-      text: `Same font metrics as the preview above — limit ~${TITLE_PX_LIMIT}px. Drafts stay on this machine.`,
-    })
-  );
-}
+// (Title workshop merged into the Search preview card above — drafts now edit
+// the live facsimile directly.)
 
 /* ============================================================
    TAB: Technical
@@ -4601,7 +4723,6 @@ function renderTechnical(a) {
   const out = [];
 
   out.push(renderSerpPreview(a));
-  out.push(renderTitleWorkshop(a));
 
   const titlePx = estimateTitlePx(a.title || "");
   const titleStatus =
@@ -4718,9 +4839,16 @@ function renderTechnical(a) {
     const issueRows = computeHreflangIssues(a).map((iss) =>
       checkRow({ status: iss.status, label: iss.label, detail: iss.detail })
     );
-    const rows = a.hreflang.map((hl) =>
-      checkRow({ status: "neutral", label: hl.lang, detail: hl.href })
-    );
+    const rowMap = new Map(); // normalized href -> [row elements]
+    const rows = a.hreflang.map((hl) => {
+      const row = checkRow({ status: "neutral", label: hl.lang, detail: hl.href });
+      if (hl.href) {
+        const k = normalizeForCompare(hl.href);
+        if (!rowMap.has(k)) rowMap.set(k, []);
+        rowMap.get(k).push(row);
+      }
+      return row;
+    });
 
     // reciprocity: fetch each alternate, confirm it links back to this page —
     // the #1 hreflang failure mode, and one almost nothing free verifies.
@@ -4803,20 +4931,25 @@ function renderTechnical(a) {
                 }
           )
         );
-        results.forEach((r) =>
-          recipWrap.appendChild(
-            checkRow({
-              status: r.status === "ok" ? "green" : r.status === "missing" ? "red" : "amber",
-              label: r.x.lang,
-              detail:
-                r.status === "ok"
-                  ? "points back"
-                  : r.status === "missing"
-                  ? "no return hreflang to this page"
-                  : "unreachable",
-            })
-          )
-        );
+        // verdicts land IN the list above — each row's dot flips in place
+        const paint = (rowEls, band, original, suffix) => {
+          (rowEls || []).forEach((row) => {
+            const dot = row.querySelector(".dot");
+            if (dot) dot.className = "dot dot--" + band;
+            const det = row.querySelector(".check-detail");
+            if (det) det.textContent = original + " · " + suffix;
+          });
+        };
+        (a.hreflang || []).forEach((x) => {
+          if (x.href && normalizeForCompare(x.href) === normalizeForCompare(a.url))
+            paint(rowMap.get(normalizeForCompare(x.href)), "green", x.href, "this page");
+        });
+        results.forEach((r) => {
+          const band = r.status === "ok" ? "green" : r.status === "missing" ? "red" : "amber";
+          const suffix =
+            r.status === "ok" ? "points back ✓" : r.status === "missing" ? "NO return tag" : "unreachable";
+          paint(rowMap.get(normalizeForCompare(r.x.href)), band, r.x.href, suffix);
+        });
         if (others.length > capped.length)
           recipWrap.appendChild(
             h("p", { class: "note", text: `Checked the first ${capped.length} of ${others.length} alternates.` })
@@ -5128,6 +5261,16 @@ function renderCrawlability(a) {
             : (d.sitemapUrls && d.sitemapUrls[0]) || "",
         })
       );
+      if (d.sitemapUrls && d.sitemapUrls.length)
+        rows.appendChild(
+          h(
+            "div",
+            { style: { display: "flex", flexWrap: "wrap", gap: "8px", marginTop: "6px" } },
+            d.sitemapUrls
+              .slice(0, 4)
+              .map((u) => linkButton(truncate(u.replace(/^https?:\/\//i, ""), 44), u))
+          )
+        );
       bits.push(rows);
     }
   }
@@ -5143,9 +5286,9 @@ let serverView = { key: null, loading: false, data: null, error: null };
 
 const SV_HEADERS = ["x-robots-tag", "content-type", "last-modified", "cache-control", "link"];
 
-async function fetchServerView(url) {
+async function fetchServerView(url, timeoutMs) {
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 12000);
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs || 12000);
   try {
     const res = await fetch(url, {
       method: "GET",
@@ -5521,7 +5664,9 @@ function siteCrawlTargets(a) {
 }
 
 async function auditUrlLite(url) {
-  const res = await fetchServerView(url);
+  // shorter per-page timeout than Server view — bot-walled sites hang the
+  // full window and a 15-page crawl shouldn't take a minute to fail
+  const res = await fetchServerView(url, 9000);
   if (!res.ok) return { url, error: res.message };
   const raw = parseRawHtml(res.html, res.finalUrl || url);
   const noindex =
@@ -5595,28 +5740,32 @@ function renderSite(a) {
     );
     progress.appendChild(statusEl);
     const label = statusEl.lastChild;
-    let done = 0;
-    const pages = await runPool(targets, auditUrlLite, 4, () => {
-      done++;
-      label.textContent = `Crawling… ${done} / ${targets.length}`;
-    });
-    // the current page joins the comparison set from its own (rendered) audit
-    const thisPage = {
-      url: a.url,
-      status: null,
-      thisPage: true,
-      title: a.title || "",
-      description: a.metaDescription || "",
-      canonical: a.canonical,
-      noindex: /\b(?:noindex|none)\b/i.test(`${a.robotsMeta || ""} ${a.googlebotMeta || ""}`),
-      h1Count: (a.headings || []).filter((x) => x.level === 1).length,
-    };
-    siteView = {
-      key,
-      loading: false,
-      error: null,
-      data: { pages: [thisPage, ...pages], crawled: pages.length },
-    };
+    try {
+      let done = 0;
+      const pages = await runPool(targets, auditUrlLite, 5, () => {
+        done++;
+        label.textContent = `Crawling… ${done} / ${targets.length}`;
+      });
+      // the current page joins the comparison set from its own (rendered) audit
+      const thisPage = {
+        url: a.url,
+        status: null,
+        thisPage: true,
+        title: a.title || "",
+        description: a.metaDescription || "",
+        canonical: a.canonical,
+        noindex: /\b(?:noindex|none)\b/i.test(`${a.robotsMeta || ""} ${a.googlebotMeta || ""}`),
+        h1Count: (a.headings || []).filter((x) => x.level === 1).length,
+      };
+      siteView = {
+        key,
+        loading: false,
+        error: null,
+        data: { pages: [thisPage, ...pages], crawled: pages.length },
+      };
+    } catch (e) {
+      siteView = { key, loading: false, data: null, error: (e && e.message) || "Crawl failed." };
+    }
     renderActiveTab();
   });
 
@@ -5633,10 +5782,26 @@ function renderSite(a) {
     )
   );
 
-  out.push(renderBulkCard());
-
+  // crawl state survives tab switches and mid-crawl re-renders
+  if (siteView.key === key && siteView.loading)
+    out.push(
+      card(
+        null,
+        {},
+        h(
+          "div",
+          { class: "linkcheck-status" },
+          h("span", { class: "linkcheck-spinner" }),
+          h("span", { text: "Crawl in progress — keep the panel on this page; results appear here." })
+        )
+      )
+    );
+  if (siteView.key === key && siteView.error)
+    out.push(card("Result", {}, checkRow({ status: "red", label: "Crawl failed", detail: siteView.error })));
   if (siteView.key === key && siteView.data)
     out.push(...siteResultCards(siteView.data.pages, `${siteView.data.crawled} crawled`));
+
+  out.push(renderBulkCard());
 
   if (bulkView.data)
     out.push(...siteResultCards(bulkView.data.pages, `${bulkView.data.crawled} pasted`));
