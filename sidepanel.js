@@ -110,7 +110,7 @@ const VERSION = (() => {
   try {
     return chrome.runtime.getManifest().version;
   } catch {
-    return "1.7";
+    return "1.8";
   }
 })();
 let currentAudit = null;
@@ -338,6 +338,103 @@ function codeBlock(code, label) {
     ),
     h("pre", { class: "codeblock-pre", text: code })
   );
+}
+
+// Render the on-device AI's structured reply (TOPIC / ANSWERS / GAPS / META)
+// as readable prose — never monospace. Falls back to a plain paragraph block
+// if the model didn't follow the format. META is surfaced as a copyable draft.
+function aiReadBlock(raw) {
+  const SECTIONS = ["TOPIC", "ANSWERS", "GAPS", "META"];
+  const buckets = {};
+  let current = null;
+  String(raw || "")
+    .split(/\r?\n/)
+    .forEach((line) => {
+      const m = line.match(/^\s*(TOPIC|ANSWERS|GAPS|META)\s*:\s*(.*)$/i);
+      if (m) {
+        current = m[1].toUpperCase();
+        buckets[current] = buckets[current] || [];
+        if (m[2].trim()) buckets[current].push(m[2].trim());
+      } else if (current && line.trim()) {
+        buckets[current].push(line.trim());
+      }
+    });
+
+  // Nothing matched the contract → show the model's prose as-is, but as prose.
+  if (!SECTIONS.some((s) => buckets[s] && buckets[s].length)) {
+    return h(
+      "div",
+      { class: "ai-read" },
+      ...String(raw || "")
+        .split(/\n{2,}/)
+        .filter((p) => p.trim())
+        .map((p) => h("p", { class: "ai-read-p", text: p.trim() }))
+    );
+  }
+
+  // Split a bucket into discrete bullet items (strip -, *, •, "1." markers).
+  const bullets = (arr) =>
+    (arr || [])
+      .join("\n")
+      .split(/\n+/)
+      .map((s) => s.replace(/^\s*(?:[-*•]|\d+[.)])\s*/, "").trim())
+      .filter(Boolean);
+
+  const wrap = h("div", { class: "ai-read" });
+
+  if (buckets.TOPIC && buckets.TOPIC.length) {
+    wrap.appendChild(h("div", { class: "ai-read-label", text: "What this page is about" }));
+    wrap.appendChild(h("p", { class: "ai-read-p", text: buckets.TOPIC.join(" ") }));
+  }
+
+  const answers = bullets(buckets.ANSWERS);
+  if (answers.length) {
+    wrap.appendChild(h("div", { class: "ai-read-label", text: "Questions it answers" }));
+    wrap.appendChild(
+      h("ul", { class: "ai-read-list" }, ...answers.map((b) => h("li", { text: b })))
+    );
+  }
+
+  const gaps = bullets(buckets.GAPS);
+  if (gaps.length) {
+    wrap.appendChild(h("div", { class: "ai-read-label", text: "Gaps a reader would still have" }));
+    wrap.appendChild(
+      h("ul", { class: "ai-read-list is-gap" }, ...gaps.map((b) => h("li", { text: b })))
+    );
+  }
+
+  const meta = (buckets.META || []).join(" ").trim();
+  if (meta) {
+    const len = [...meta].length;
+    wrap.appendChild(
+      h(
+        "div",
+        { class: "ai-meta" },
+        h(
+          "div",
+          { class: "ai-meta-head" },
+          h("span", { class: "ai-meta-label", text: "Suggested meta description (draft)" }),
+          h("span", {
+            class: "ai-meta-count" + (len > 155 ? " is-over" : ""),
+            text: len + " ch",
+          })
+        ),
+        h("p", { class: "ai-meta-text", text: meta }),
+        h(
+          "button",
+          {
+            class: "ai-meta-copy",
+            type: "button",
+            onclick: () => copyText(meta, "Draft meta copied"),
+          },
+          h("span", { class: "codeblock-copy-ico", html: ICON.copy }),
+          "Copy draft"
+        )
+      )
+    );
+  }
+
+  return wrap;
 }
 
 /* ---- score helpers (LLM readability) ---- */
@@ -1371,6 +1468,7 @@ function computeTriage(a) {
       detail: `Robots meta contains "${
         /\bnone\b/i.test(robotsAll) ? "none" : "noindex"
       }" — search engines are instructed not to index this page.`,
+      fixKey: "noindex",
     });
 
   if (!a.title || !a.title.trim())
@@ -1378,6 +1476,7 @@ function computeTriage(a) {
       sev: "critical",
       label: "Missing <title>",
       detail: "The most important on-page element — search results have nothing to show.",
+      fixKey: "title",
     });
 
   // conflicting canonicals — search engines may ignore all canonical hints
@@ -1398,6 +1497,7 @@ function computeTriage(a) {
       sev: "critical",
       label: h1 === 0 ? "No H1 on the page" : `Multiple H1s (${h1})`,
       detail: "A page should have exactly one H1 as its main topic.",
+      fixKey: h1 === 0 ? "h1" : undefined,
     });
 
   // ---- WARNING (impact-ordered) ----
@@ -1409,6 +1509,7 @@ function computeTriage(a) {
       sev: "warning",
       label: "Canonical points to a different URL",
       detail: `canonical: ${a.canonical} — search engines are told to index that URL instead of this one. Fine if intentional (parameter cleanup, pagination); a serious bug if not.`,
+      fixKey: "canonical-self",
     });
 
   if ((tc.canonical || 0) > 1 && canonDistinct.length === 1)
@@ -1423,6 +1524,7 @@ function computeTriage(a) {
       sev: "warning",
       label: "Canonical tag inside <body>",
       detail: "Canonical link tags are only honored in <head> — this one is ignored.",
+      fixKey: "canonical-move",
     });
 
   if ((tc.title || 0) > 1)
@@ -1444,6 +1546,7 @@ function computeTriage(a) {
       sev: "warning",
       label: "No meta description",
       detail: "Search engines will improvise a snippet from page text — you lose control of the pitch.",
+      fixKey: "meta-desc",
     });
 
   const relOg = relativeOgImage(a);
@@ -1452,6 +1555,7 @@ function computeTriage(a) {
       sev: "warning",
       label: "og:image is a relative URL",
       detail: `"${truncate(relOg, 60)}" — most platforms require an absolute URL and will show no image.`,
+      fixKey: "og-abs",
     });
 
   // mixed content — insecure assets on a secure page
@@ -2059,11 +2163,11 @@ function renderAiRead(a) {
     else if (aiView.error)
       bits.push(checkRow({ status: "amber", label: "Couldn't run the model", detail: aiView.error }));
     else if (aiView.output) {
-      bits.push(codeBlock(aiView.output, "On-device AI read"));
+      bits.push(aiReadBlock(aiView.output));
       bits.push(
         h("p", {
           class: "note",
-          text: "Generated locally by Chrome's built-in Gemini Nano — nothing left this machine. Treat the META line as a draft.",
+          text: "Generated locally by Chrome's built-in Gemini Nano — nothing left this machine. The meta description is a draft.",
         })
       );
     }
@@ -2675,9 +2779,16 @@ function renderContent(a) {
       })
     );
     if (wf.long.length) {
-      const list = h("div", { class: "triage-items" });
+      const list = h("div", { class: "prose-samples" });
       wf.long.forEach((s) =>
-        list.appendChild(h("div", { class: "triage-item", text: `(${s.words}w) ${s.text}…` }))
+        list.appendChild(
+          h(
+            "div",
+            { class: "prose-sample" },
+            h("span", { class: "prose-sample-tag", text: `${s.words}w` }),
+            h("span", { class: "prose-sample-text", text: `${s.text}…` })
+          )
+        )
       );
       wfBody.appendChild(list);
     }
@@ -3417,6 +3528,79 @@ function destinationHealth(dest, a) {
   return { worst, issues };
 }
 
+// Deterministic paste-ready fixes — assembled from the page's own scraped
+// values and the rule that flagged the finding. No AI, no guessing: where the
+// fix needs human-written prose (a title, a description) we hand over the
+// correct tag with a clear placeholder and let the user fill the words.
+function buildFix(f, a) {
+  const firstH1 = (a.headings || []).find((h) => h.level === 1);
+  switch (f && f.fixKey) {
+    case "canonical-self":
+      return {
+        code: `<link rel="canonical" href="${a.url}" />`,
+        note: "Replace the existing canonical in <head> — if pointing elsewhere was intentional, ignore this.",
+      };
+    case "canonical-move":
+      return {
+        code: `<link rel="canonical" href="${a.canonical || a.url}" />`,
+        note: "Move the canonical tag out of <body> and into <head>.",
+      };
+    case "noindex":
+      return {
+        code: `<meta name="robots" content="index, follow" />`,
+        note: "Replace the noindex robots meta in <head> (or delete it) so the page can be indexed.",
+      };
+    case "meta-desc":
+      return {
+        code: `<meta name="description" content="Write a 150–160 character summary of this page." />`,
+        note: "Add to <head>, then replace the placeholder with your own pitch.",
+      };
+    case "title":
+      return {
+        code: `<title>${(a.title || (firstH1 && firstH1.text) || "Your page title — aim for 50–60 characters")}</title>`,
+        note: "Add inside <head>; one per page.",
+      };
+    case "h1":
+      return {
+        code: `<h1>${a.title || (firstH1 && firstH1.text) || "Your main page heading"}</h1>`,
+        note: "Add one near the top of <body> as the page's main heading.",
+      };
+    case "og-abs": {
+      const rel = relativeOgImage(a);
+      if (!rel) return null;
+      let abs = rel;
+      try {
+        abs = new URL(rel, a.origin || a.url).href;
+      } catch {}
+      return {
+        code: `<meta property="og:image" content="${abs}" />`,
+        note: "Replace the relative og:image with this absolute URL.",
+      };
+    }
+    default:
+      return null;
+  }
+}
+
+function fixChip(fx) {
+  const wrap = h("div", { class: "fixchip" });
+  const btn = h(
+    "button",
+    {
+      class: "fixchip-btn",
+      type: "button",
+      onclick: () => copyText(fx.code, "Fix copied"),
+    },
+    h("span", { class: "codeblock-copy-ico", html: ICON.copy }),
+    "Copy fix"
+  );
+  wrap.appendChild(
+    h("div", { class: "fixchip-head" }, btn, h("code", { class: "fixchip-code", text: fx.code }))
+  );
+  if (fx.note) wrap.appendChild(h("div", { class: "fixchip-note", text: fx.note }));
+  return wrap;
+}
+
 function renderOverview(a) {
   const out = [];
   const key = normalizeUrl(a.url);
@@ -3541,6 +3725,8 @@ function renderOverview(a) {
       if (age) t.appendChild(pill(age.isNew ? "NEW" : `${age.scans} scans`, age.isNew ? "red" : "accent"));
       row.appendChild(t);
       if (f.detail) row.appendChild(h("div", { class: "ov-find-ev", text: f.detail }));
+      const fx = buildFix(f, a);
+      if (fx) row.appendChild(fixChip(fx));
       if (f.items && f.items.length) {
         const listEl = h("div", { class: "triage-items" });
         f.items.forEach((it) => {
@@ -7548,6 +7734,61 @@ function buildMarkdown(a) {
   L.push(`- Transfer: ${fmtBytes(p.transferSize)} · Requests: ${p.resourceCount ?? "—"}`);
   L.push("");
 
+  // Competitive term gaps — only if a Compete run happened for this URL
+  if (competeView.key === normalizeUrl(a.url) && competeView.data) {
+    const { rivals, gap } = competeView.data;
+    const okRivals = rivals.filter((r) => !r.error);
+    if (okRivals.length) {
+      L.push(`## Competitive term gaps (${okRivals.length} rival page${okRivals.length === 1 ? "" : "s"})`);
+      L.push(`- Compared against: ${okRivals.map((r) => r.host).join(", ")}`);
+      if (!gap.length) {
+        L.push("- No meaningful term gaps — this page covers the vocabulary the rivals use.");
+      } else {
+        L.push(`- ${gap.length} term${gap.length === 1 ? "" : "s"} the rivals use meaningfully but this page misses or underuses:`);
+        gap.forEach((g) =>
+          L.push(
+            `    - ${g.term} (${g.kind}): on ${g.rivalsWith}/${okRivals.length} rivals, ~${g.theirAvgCount}× each; this page ${g.yourCount}×`
+          )
+        );
+        L.push("- Coverage ideas, not stuffing targets.");
+      }
+      L.push("");
+    }
+  }
+
+  // Wayback drift — only if the archive was queried for this URL
+  if (waybackView.key === normalizeUrl(a.url) && waybackView.data && !waybackView.data.never) {
+    const d = waybackView.data;
+    L.push("## History (Internet Archive)");
+    if (d.first && !d.first.failed)
+      L.push(`- First capture ${waybackTs(d.first.ts)}: title "${d.first.title || "—"}" · ${d.first.words} words`);
+    if (d.last && d.last !== d.first && !d.last.failed)
+      L.push(`- Latest capture ${waybackTs(d.last.ts)}: title "${d.last.title || "—"}" · ${d.last.words} words`);
+    if (d.first && d.last && !d.first.failed && !d.last.failed) {
+      const dw = d.last.words - d.first.words;
+      const titleChanged = (d.first.title || "") !== (d.last.title || "");
+      L.push(`- Drift: ${dw === 0 ? "word count unchanged" : `${dw > 0 ? "+" : ""}${dw} words`}; title ${titleChanged ? "changed" : "unchanged"} since first capture.`);
+    }
+    L.push("");
+  }
+
+  // SERP X-Ray — only on a Google results page (data rides on the audit)
+  if (a.serp && a.serp.results && a.serp.results.length) {
+    const s = a.serp;
+    L.push("## SERP X-Ray (the Google results page being viewed)");
+    if (s.query) L.push(`- Query: "${s.query}"`);
+    L.push(`- ${s.results.length} organic results captured:`);
+    s.results.forEach((r, i) => L.push(`    ${i + 1}. ${r.title} — ${r.host}`));
+    if (s.paa && s.paa.length) {
+      L.push(`- People also ask: ${s.paa.map((q) => (typeof q === "string" ? q : q.text || q.question || "")).filter(Boolean).join(" | ")}`);
+    }
+    if (s.related && s.related.length) {
+      L.push(`- Related searches: ${s.related.map((q) => (typeof q === "string" ? q : q.text || "")).filter(Boolean).join(" | ")}`);
+    }
+    L.push("- Best-effort read of Google's shifting markup — verify before relying on it.");
+    L.push("");
+  }
+
   return L.join("\n");
 }
 
@@ -7650,20 +7891,20 @@ function buildHtmlReport(a) {
   const a11yBad = computeA11y(a).filter((c) => c.status !== "green");
   const ee = extractEeat(a);
   const p = a.performance || {};
-  const SEV = { critical: "#e5484d", warning: "#e8930c", pass: "#30a46c" };
-
-  const findingList = (items, color) =>
+  // Daylight: severity is carried by SHAPE (diamond / triangle / disc) so it
+  // survives black-and-white printing, never by colour alone.
+  const findingList = (items, sev) =>
     items
       .map(
         (f) =>
-          `<li><span class="sev" style="background:${color}"></span><b>${e(f.label)}</b>` +
+          `<li class="f-${sev}"><span class="mk mk-${sev}"></span><div class="fc"><b>${e(f.label)}</b>` +
           (f.detail ? `<div class="fd">${e(f.detail)}</div>` : "") +
           (f.items && f.items.length
             ? `<div class="fd">${f.items.slice(0, 15).map((x) => e(x.text)).join("<br>")}${
                 f.items.length > 15 ? `<br>…and ${f.items.length - 15} more` : ""
               }</div>`
             : "") +
-          `</li>`
+          `</div></li>`
       )
       .join("") || `<li class="none">none</li>`;
 
@@ -7688,7 +7929,7 @@ function buildHtmlReport(a) {
               label: `${r.field} — ${r.verdict}`,
               detail: `server: ${r.server != null ? r.server : "(not set)"} · rendered: ${r.rendered != null ? r.rendered : "(not set)"}`,
             })),
-            SEV.warning
+            "warning"
           )}</ul>`
         : `<p>No drift — server HTML and rendered DOM agree.</p>`);
   }
@@ -7709,41 +7950,117 @@ function buildHtmlReport(a) {
         .join("");
   }
 
+  let competeBlock = "";
+  if (competeView.key === normalizeUrl(a.url) && competeView.data) {
+    const { rivals, gap } = competeView.data;
+    const okRivals = rivals.filter((r) => !r.error);
+    if (okRivals.length) {
+      competeBlock =
+        `<h2>Competitive term gaps</h2><table>` +
+        kv("Rivals compared", okRivals.map((r) => r.host).join(", ")) +
+        kv("Term gaps", gap.length) +
+        `</table>` +
+        (gap.length
+          ? `<ul class="flist">${findingList(
+              gap.map((g) => ({
+                label: `${g.term} — ${g.kind}`,
+                detail: `on ${g.rivalsWith}/${okRivals.length} rivals, ~${g.theirAvgCount}× each · this page ${g.yourCount}×`,
+              })),
+              "warning"
+            )}</ul>`
+          : `<p>No meaningful term gaps — this page covers the vocabulary the rivals use.</p>`);
+    }
+  }
+
+  let waybackBlock = "";
+  if (waybackView.key === normalizeUrl(a.url) && waybackView.data && !waybackView.data.never) {
+    const d = waybackView.data;
+    const rows = [];
+    if (d.first && !d.first.failed)
+      rows.push(kv(`First capture (${waybackTs(d.first.ts)})`, `${d.first.title || "—"} · ${d.first.words} words`));
+    if (d.last && d.last !== d.first && !d.last.failed)
+      rows.push(kv(`Latest capture (${waybackTs(d.last.ts)})`, `${d.last.title || "—"} · ${d.last.words} words`));
+    if (d.first && d.last && !d.first.failed && !d.last.failed) {
+      const dw = d.last.words - d.first.words;
+      const titleChanged = (d.first.title || "") !== (d.last.title || "");
+      rows.push(kv("Drift since first capture", `${dw === 0 ? "word count unchanged" : (dw > 0 ? "+" : "") + dw + " words"} · title ${titleChanged ? "changed" : "unchanged"}`));
+    }
+    if (rows.length) waybackBlock = `<h2>History (Internet Archive)</h2><table>${rows.join("")}</table>`;
+  }
+
+  let serpBlock = "";
+  if (a.serp && a.serp.results && a.serp.results.length) {
+    const s = a.serp;
+    serpBlock =
+      `<h2>SERP X-Ray${s.query ? ` — “${e(s.query)}”` : ""}</h2>` +
+      `<ul class="flist">${s.results
+        .map((r, i) => `<li class="f-pass"><span class="mk mk-pass"></span><div class="fc"><b>${i + 1}. ${e(r.title)}</b><div class="fd">${e(r.host)}</div></div></li>`)
+        .join("")}</ul>` +
+      `<p class="fd">Best-effort read of Google's shifting markup — verify before relying on it.</p>`;
+  }
+
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>SEO audit — ${e(a.title || a.url)}</title>
 <style>
-  body{font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:#1d1d1f;margin:40px auto;max-width:760px;padding:0 24px}
-  header{border-bottom:2px solid #1d1d1f;padding-bottom:14px;margin-bottom:22px}
-  h1{font-size:22px;margin:0 0 4px}
-  h2{font-size:13px;text-transform:uppercase;letter-spacing:.07em;margin:28px 0 10px;border-bottom:1px solid #ddd;padding-bottom:5px}
-  .meta{font-size:12px;color:#444;word-break:break-all}
-  .chips{display:flex;flex-wrap:wrap;gap:10px;margin:16px 0 0}
-  .chip{border-radius:8px;padding:7px 13px;color:#fff;font-weight:700;font-size:13px}
+  :root{--ink:#17160f;--bone:#f3eee0;--paper:#fffdf6;--hair:rgba(23,22,15,.16);--line:rgba(23,22,15,.28);
+    --red:#b3271e;--amber:#8a5d06;--green:#187a4b;--red-soft:#fbe5e1;--amber-soft:#f9efd2;--green-soft:#e3f3e9}
+  *{box-sizing:border-box}
+  body{font:14px/1.55 "Inter",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    color:var(--ink);background:var(--bone);margin:0;padding:40px 0}
+  .sheet{background:var(--paper);max-width:780px;margin:0 auto;padding:40px 44px;
+    border:1.5px solid var(--ink);border-radius:12px}
+  header{border-bottom:2px solid var(--ink);padding-bottom:16px;margin-bottom:8px}
+  .brand{font-family:"Space Grotesk","Inter",sans-serif;font-size:11px;font-weight:700;
+    text-transform:uppercase;letter-spacing:.14em;margin-bottom:6px}
+  h1{font-family:"Space Grotesk","Inter",sans-serif;font-size:23px;font-weight:700;margin:0 0 6px;letter-spacing:-.01em}
+  h2{font-family:"Space Grotesk","Inter",sans-serif;font-size:11px;font-weight:700;text-transform:uppercase;
+    letter-spacing:.1em;margin:30px 0 12px;padding-bottom:6px;border-bottom:1.5px solid var(--ink)}
+  .meta{font-size:11.5px;word-break:break-all;line-height:1.5}
+  .chips{display:flex;flex-wrap:wrap;gap:8px;margin:16px 0 4px}
+  .chip{display:inline-flex;align-items:center;gap:7px;border:1.5px solid var(--ink);
+    border-radius:8px;padding:6px 12px;font-weight:650;font-size:12.5px}
+  .chip.c-crit{background:var(--red-soft)} .chip.c-warn{background:var(--amber-soft)}
+  .chip.c-pass{background:var(--green-soft)} .chip.c-read{background:rgba(23,22,15,.05)}
+  .chip b{font-weight:800;font-variant-numeric:tabular-nums}
   ul.flist{list-style:none;padding:0;margin:0}
-  ul.flist li{padding:7px 0;border-bottom:1px solid #eee}
-  .sev{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:8px}
-  .fd{font-size:12px;color:#333;margin:2px 0 0 17px;word-break:break-word}
-  li.none{color:#555}
-  table{border-collapse:collapse;width:100%;font-size:13px}
-  th{text-align:left;font-weight:600;padding:6px 10px 6px 0;vertical-align:top;white-space:nowrap;width:185px}
-  td{padding:6px 0;word-break:break-word}
-  tr{border-bottom:1px solid #f0f0f0}
-  footer{margin-top:34px;font-size:11px;color:#444;border-top:1px solid #ddd;padding-top:10px}
-  @media print{body{margin:10mm auto}h2{break-after:avoid}li{break-inside:avoid}}
+  ul.flist li{display:flex;gap:10px;align-items:flex-start;padding:9px 11px;margin:5px 0;
+    border:1.25px solid var(--hair);border-radius:8px}
+  li.f-critical{background:var(--red-soft)} li.f-warning{background:var(--amber-soft)} li.f-pass{background:var(--green-soft)}
+  li.none{color:var(--ink);opacity:.6;border-style:dashed;justify-content:center}
+  .fc{flex:1;min-width:0}
+  .fc b{font-weight:700}
+  /* severity by shape — prints in B&W */
+  .mk{flex:none;width:11px;height:11px;margin-top:3px}
+  .mk-critical{background:var(--red);transform:rotate(45deg)}
+  .mk-warning{width:0;height:0;background:none;
+    border-left:6px solid transparent;border-right:6px solid transparent;border-bottom:11px solid var(--amber)}
+  .mk-pass{background:var(--green);border-radius:50%}
+  .fd{font-size:11.5px;margin:3px 0 0;word-break:break-word;line-height:1.45;opacity:.85}
+  table{border-collapse:collapse;width:100%;font-size:12.5px}
+  th{text-align:left;font-weight:700;padding:7px 12px 7px 0;vertical-align:top;white-space:nowrap;width:185px}
+  td{padding:7px 0;word-break:break-word}
+  tr{border-bottom:1px solid var(--hair)}
+  p{font-size:12.5px;line-height:1.5}
+  footer{margin-top:36px;font-size:10.5px;border-top:1.5px solid var(--ink);padding-top:12px;line-height:1.5}
+  @media print{body{background:#fff;padding:0}.sheet{border:none;border-radius:0;max-width:none;padding:10mm 12mm}
+    h2{break-after:avoid}li{break-inside:avoid}
+    li.f-critical,li.f-warning,li.f-pass,.chip{-webkit-print-color-adjust:exact;print-color-adjust:exact}}
 </style></head><body>
+<div class="sheet">
 <header>
-  <h1>On-page SEO audit</h1>
+  <div class="brand">⁂ SEOdin · On-page audit</div>
+  <h1>${e(a.title || a.url)}</h1>
   <div class="meta">${e(a.url)}<br>Generated ${e(new Date().toLocaleString())} · SEOdin v${e(VERSION)} · source: ${a.domSource === "rendered" ? "rendered DOM (post-JavaScript)" : "raw HTML"}</div>
   <div class="chips">
-    <span class="chip" style="background:${SEV.critical}">${crit.length} critical</span>
-    <span class="chip" style="background:${SEV.warning}">${warn.length} warnings</span>
-    <span class="chip" style="background:${SEV.pass}">${pass.length} passed</span>
-    <span class="chip" style="background:#52525b">LLM readability ${rd.overall}/100</span>
+    <span class="chip c-crit"><span class="mk mk-critical"></span><b>${crit.length}</b> critical</span>
+    <span class="chip c-warn"><span class="mk mk-warning"></span><b>${warn.length}</b> warnings</span>
+    <span class="chip c-pass"><span class="mk mk-pass"></span><b>${pass.length}</b> passed</span>
+    <span class="chip c-read">LLM readability <b>${rd.overall}</b>/100</span>
   </div>
 </header>
-<h2>Critical</h2><ul class="flist">${findingList(crit, SEV.critical)}</ul>
-<h2>Warnings</h2><ul class="flist">${findingList(warn, SEV.warning)}</ul>
-<h2>Passed</h2><ul class="flist">${findingList(pass, SEV.pass)}</ul>
+<h2>Critical</h2><ul class="flist">${findingList(crit, "critical")}</ul>
+<h2>Warnings</h2><ul class="flist">${findingList(warn, "warning")}</ul>
+<h2>Passed</h2><ul class="flist">${findingList(pass, "pass")}</ul>
 <h2>Technical snapshot</h2>
 <table>
 ${kv("Title (" + a.titleLength + " ch)", a.title)}
@@ -7760,11 +8077,15 @@ ${kv("Schema types", [...typeSet].join(", ") || "none")}
 ${kv("E-E-A-T author", ee.authorName ? ee.authorName + (ee.authorSource ? " (" + ee.authorSource + ")" : "") : "not found")}
 ${kv("LCP / CLS (this load)", fmtMs(p.lcp) + " / " + (p.cls == null ? "—" : p.cls.toFixed(3)))}
 </table>
-${issues.length ? `<h2>Schema issues</h2><ul class="flist">${findingList(issues.map((i) => ({ label: i.label, detail: i.detail })), SEV.warning)}</ul>` : ""}
-<h2>Accessibility (quick checks — failures only)</h2><ul class="flist">${findingList(a11yBad.map((c) => ({ label: c.label, detail: c.detail })), SEV.warning)}</ul>
+${issues.length ? `<h2>Schema issues</h2><ul class="flist">${findingList(issues.map((i) => ({ label: i.label, detail: i.detail })), "warning")}</ul>` : ""}
+<h2>Accessibility (quick checks — failures only)</h2><ul class="flist">${findingList(a11yBad.map((c) => ({ label: c.label, detail: c.detail })), "warning")}</ul>
 ${serverBlock}
 ${siteBlock}
+${competeBlock}
+${waybackBlock}
+${serpBlock}
 <footer>Generated locally by SEOdin — no data left this machine. Checks labelled “heuristic” in-app are signals, not verdicts.</footer>
+</div>
 </body></html>`;
 }
 

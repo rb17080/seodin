@@ -1172,6 +1172,115 @@ body::before {
   line-height: 1.45;
 }
 
+/* on-device AI read — prose, never monospace */
+.ai-read {
+  margin: 8px 0 2px 16px;
+}
+.ai-read-label {
+  font-family: var(--font-display);
+  font-size: 9.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin: 12px 0 4px;
+}
+.ai-read-label:first-child {
+  margin-top: 0;
+}
+.ai-read-p {
+  margin: 0;
+  font-family: var(--font-ui);
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text-primary);
+}
+.ai-read-list {
+  margin: 2px 0 0;
+  padding-left: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.ai-read-list li {
+  font-family: var(--font-ui);
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--text-primary);
+}
+.ai-read-list.is-gap {
+  list-style: none;
+  padding-left: 0;
+}
+.ai-read-list.is-gap li {
+  padding-left: 16px;
+  position: relative;
+}
+.ai-read-list.is-gap li::before {
+  content: "?";
+  position: absolute;
+  left: 2px;
+  font-family: var(--font-display);
+  font-weight: 700;
+}
+.ai-meta {
+  margin: 12px 0 2px;
+  border: 1.5px solid var(--border-strong);
+  border-radius: var(--radius-control);
+  background: var(--bg-card-inset);
+  padding: 9px 11px;
+}
+.ai-meta-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.ai-meta-label {
+  font-family: var(--font-display);
+  font-size: 9.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.ai-meta-count {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+}
+.ai-meta-count.is-over {
+  color: var(--red);
+}
+.ai-meta-text {
+  margin: 0 0 8px;
+  font-family: var(--font-ui);
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--text-primary);
+  user-select: text;
+}
+.ai-meta-copy {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-family: inherit;
+  font-size: 10.5px;
+  font-weight: 650;
+  color: var(--text-primary);
+  background: transparent;
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+  padding: 2px 8px;
+  cursor: pointer;
+  transition: background 130ms ease;
+}
+.ai-meta-copy:hover {
+  background: var(--btn-bg-hover);
+}
+.ai-meta-copy:active {
+  transform: scale(0.97);
+}
+
 /* evidence lists under findings */
 .triage-items {
   margin: 2px 0 6px 16px;
@@ -1185,6 +1294,39 @@ body::before {
   font-family: var(--font-mono);
   font-size: 10.5px;
   word-break: break-all;
+  user-select: text;
+}
+
+/* prose evidence (quoted sentences) — reading font, not mono/break-all */
+.prose-samples {
+  margin: 4px 0 6px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 280px;
+  overflow-y: auto;
+}
+.prose-sample {
+  display: flex;
+  gap: 7px;
+  align-items: baseline;
+}
+.prose-sample-tag {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  font-weight: 600;
+  padding: 1px 5px;
+  border: 1px solid var(--hairline);
+  border-radius: 5px;
+  white-space: nowrap;
+  margin-top: 1px;
+}
+.prose-sample-text {
+  font-family: var(--font-ui);
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-primary);
   user-select: text;
 }
 
@@ -2304,6 +2446,60 @@ body::before {
   font-weight: 420;
   margin: 2px 0 2px 22px;
   word-break: break-word;
+}
+/* deterministic paste-ready fix attached to a finding */
+.fixchip {
+  margin: 6px 0 2px 22px;
+  border: 1.25px solid var(--hairline);
+  border-radius: var(--radius-control);
+  background: var(--bg-card-inset);
+  padding: 7px 8px;
+}
+.fixchip-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.fixchip-btn {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-family: var(--font-display);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--accent-contrast);
+  background: var(--accent);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  padding: 3px 9px;
+  cursor: pointer;
+  transition: transform 120ms ease, opacity 120ms ease;
+}
+.fixchip-btn:hover {
+  opacity: 0.88;
+}
+.fixchip-btn:active {
+  transform: scale(0.97);
+}
+.fixchip-code {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  line-height: 1.4;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow-x: auto;
+  user-select: text;
+}
+.fixchip-note {
+  margin: 5px 0 0;
+  font-size: 11px;
+  font-weight: 420;
+  line-height: 1.4;
 }
 .ov-pass-row {
   display: flex;
