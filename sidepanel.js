@@ -110,11 +110,11 @@ const VERSION = (() => {
   try {
     return chrome.runtime.getManifest().version;
   } catch {
-    return "1.6";
+    return "1.7";
   }
 })();
 let currentAudit = null;
-let currentTabId = "triage";
+let currentTabId = "overview";
 let panelState = "loading"; // loading | ready | restricted | error
 let activeBrowserTab = null;
 const viewModes = { schema: "tree" }; // per-card view toggles
@@ -199,8 +199,12 @@ function domainOf(url) {
 /* ============================================================
    reusable components
    ============================================================ */
+// Severity always carries a shape, never color alone: ✕ critical, ▲ warning,
+// ✓ pass, · neutral. (Our own accessibility tab would flag color-only dots.)
 function statusDot(status) {
-  return h("span", { class: "dot dot--" + status });
+  const glyph =
+    status === "green" ? "✓" : status === "amber" ? "▲" : status === "red" ? "✕" : "·";
+  return h("span", { class: "dot dot--" + (status || "neutral"), text: glyph });
 }
 
 function card(label, { right = null, tight = false } = {}, ...children) {
@@ -2807,6 +2811,34 @@ computeReadability = memo1(computeReadability);
 computeContent = memo1(computeContent);
 computeA11y = memo1(computeA11y);
 
+/* ---- overall health score: share of checks passing (transparent math) ---- */
+function computeScore(a) {
+  const t = computeTriage(a);
+  const crit = t.filter((f) => f.sev === "critical").length;
+  const warn = t.filter((f) => f.sev === "warning").length;
+  const pass = t.filter((f) => f.sev === "pass").length;
+  const total = crit + warn + pass || 1;
+  return { score: Math.round((100 * pass) / total), crit, warn, pass, total };
+}
+const snapScore = (s) =>
+  Math.round(
+    (100 * s.triage.pass) / (s.triage.critical + s.triage.warning + s.triage.pass || 1)
+  );
+
+// How long has a finding existed on this URL? (reads per-URL snapshot keys)
+function findingAge(label) {
+  if (!historyState || !historyState.prev || !Array.isArray(historyState.prev.keys))
+    return null;
+  if (!historyState.prev.keys.includes(label)) return { isNew: true, scans: 1 };
+  let n = 1;
+  const list = historyState.list || [];
+  for (let i = 1; i < list.length; i++) {
+    if (Array.isArray(list[i].keys) && list[i].keys.includes(label)) n++;
+    else break;
+  }
+  return { isNew: false, scans: n + 1 };
+}
+
 function a11yRow(chk) {
   const frag = document.createDocumentFragment();
   frag.appendChild(
@@ -2924,6 +2956,8 @@ function buildSnapshot(a) {
       warning: t.filter((f) => f.sev === "warning").length,
       pass: t.filter((f) => f.sev === "pass").length,
     },
+    // finding labels, so the next scan can mark NEW vs long-standing issues
+    keys: t.filter((f) => f.sev !== "pass").map((f) => f.label),
     schemaBlocks: (a.jsonLd || []).length,
     missingAlt: (a.images || []).filter((i) => !i.hasAlt).length,
     titlePx: estimateTitlePx(a.title || ""),
@@ -3137,6 +3171,58 @@ function waybackTs(ts) {
   return s.length >= 8 ? `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}` : s;
 }
 
+async function runWaybackScan(a) {
+  const key = normalizeUrl(a.url);
+  waybackView = { key, loading: true, data: null, error: null };
+  if (panelState === "ready") renderActiveTab();
+  // Two tiny queries (first + last capture) instead of one full-index scan —
+  // heavily archived URLs (Wikipedia!) made a single big query time out.
+  const cdxUrl = (extra) =>
+    "https://web.archive.org/cdx/search/cdx?output=json&fl=timestamp&filter=statuscode:200&url=" +
+    encodeURIComponent(a.url) +
+    extra;
+  const firstRes = await fetchText(cdxUrl("&limit=1"), 30000);
+  if (!firstRes.ok) {
+    waybackView = {
+      key,
+      loading: false,
+      data: null,
+      error: firstRes.timeout
+        ? "The archive timed out — heavily archived URLs can be slow. Try once more."
+        : "Couldn't reach the Internet Archive.",
+    };
+    if (panelState === "ready") renderActiveTab();
+    return;
+  }
+  let firstTs = null;
+  try {
+    const r1 = JSON.parse(firstRes.text);
+    if (r1.length > 1) firstTs = r1[1][0];
+  } catch {}
+  if (!firstTs) {
+    waybackView = { key, loading: false, data: { never: true }, error: null };
+    if (panelState === "ready") renderActiveTab();
+    return;
+  }
+  let lastTs = firstTs;
+  try {
+    const lastRes = await fetchText(cdxUrl("&limit=-1"), 30000);
+    const r2 = JSON.parse(lastRes.text);
+    if (lastRes.ok && r2.length > 1) lastTs = r2[1][0];
+  } catch {}
+  // `id_` returns the original archived bytes without the Wayback toolbar.
+  const snap = async (ts) => {
+    const r = await fetchText(`https://web.archive.org/web/${ts}id_/${a.url}`, 20000);
+    if (!r.ok) return { ts, failed: true };
+    const raw = parseRawHtml(r.text, a.url);
+    return { ts, title: raw.title, words: raw.wordCount };
+  };
+  const first = await snap(firstTs);
+  const last = lastTs !== firstTs ? await snap(lastTs) : first;
+  waybackView = { key, loading: false, error: null, data: { never: false, first, last } };
+  if (panelState === "ready") renderActiveTab();
+}
+
 function renderWayback(a) {
   const key = normalizeUrl(a.url);
   const btn = h("button", {
@@ -3144,61 +3230,7 @@ function renderWayback(a) {
     type: "button",
     text: waybackView.key === key && waybackView.data ? "Check again" : "Check the Wayback Machine",
   });
-  btn.addEventListener("click", async () => {
-    waybackView = { key, loading: true, data: null, error: null };
-    renderActiveTab();
-    // Two tiny queries (first + last capture) instead of one full-index scan —
-    // heavily archived URLs (Wikipedia!) made the single big query time out.
-    const cdxUrl = (extra) =>
-      "https://web.archive.org/cdx/search/cdx?output=json&fl=timestamp&filter=statuscode:200&url=" +
-      encodeURIComponent(a.url) +
-      extra;
-    const firstRes = await fetchText(cdxUrl("&limit=1"), 30000);
-    if (!firstRes.ok) {
-      waybackView = {
-        key,
-        loading: false,
-        data: null,
-        error: firstRes.timeout
-          ? "The archive timed out — heavily archived URLs can be slow. Try once more."
-          : "Couldn't reach the Internet Archive.",
-      };
-      renderActiveTab();
-      return;
-    }
-    let firstTs = null;
-    try {
-      const r1 = JSON.parse(firstRes.text);
-      if (r1.length > 1) firstTs = r1[1][0];
-    } catch {}
-    if (!firstTs) {
-      waybackView = { key, loading: false, data: { never: true }, error: null };
-      renderActiveTab();
-      return;
-    }
-    let lastTs = firstTs;
-    try {
-      const lastRes = await fetchText(cdxUrl("&limit=-1"), 30000);
-      const r2 = JSON.parse(lastRes.text);
-      if (lastRes.ok && r2.length > 1) lastTs = r2[1][0];
-    } catch {}
-    // `id_` returns the original archived bytes without the Wayback toolbar.
-    const snap = async (ts) => {
-      const r = await fetchText(`https://web.archive.org/web/${ts}id_/${a.url}`, 20000);
-      if (!r.ok) return { ts, failed: true };
-      const raw = parseRawHtml(r.text, a.url);
-      return { ts, title: raw.title, words: raw.wordCount };
-    };
-    const first = await snap(firstTs);
-    const last = lastTs !== firstTs ? await snap(lastTs) : first;
-    waybackView = {
-      key,
-      loading: false,
-      error: null,
-      data: { never: false, first, last },
-    };
-    renderActiveTab();
-  });
+  btn.addEventListener("click", () => runWaybackScan(a));
 
   const bits = [
     h("p", {
@@ -3285,26 +3317,626 @@ function renderWayback(a) {
 }
 
 /* ============================================================
+   OVERVIEW — the verdict surface: score, Deep scan, severity
+   zones, systems board, engine results. Norse stays iconographic:
+   the valknut in the header, two ravens roosting in the footer.
+   ============================================================ */
+const RAVEN_PATH = "M2 12 C5 5 11 3 14 6 L21 4 L16 9 C17 14 11 17 6 14 L2 17 Z";
+function ravenSvg(size, flip) {
+  return h("span", {
+    class: "raven",
+    html:
+      '<svg width="' + size + '" height="' + size + '" viewBox="0 0 24 24" aria-hidden="true"' +
+      (flip ? ' style="transform:scaleX(-1)"' : "") +
+      '><path d="' + RAVEN_PATH + '" fill="currentColor"/></svg>',
+  });
+}
+
+let deepScanState = { running: false };
+
+// One button, five engines: server diff, robots+sitemap, archive, site
+// sample, field data. Each engine renders its receipts as it lands.
+async function runDeepScan(a) {
+  if (deepScanState.running) return;
+  deepScanState = { running: true };
+  if (panelState === "ready") renderActiveTab();
+  await Promise.allSettled([
+    runServerScan(a),
+    runRobotsScan(a),
+    runWaybackScan(a),
+    runSiteScan(a),
+    runPsiScan(a),
+  ]);
+  deepScanState = { running: false };
+  if (panelState === "ready") renderActiveTab();
+}
+
+function engineReceipts(a) {
+  const key = normalizeUrl(a.url);
+  const wrap = h("div", { class: "ov-receipts" });
+  const push = (label, st) => {
+    if (st === null) return;
+    const glyph = st === "pending" ? "…" : st === "ok" ? "✓" : st === "warn" ? "▲" : "✕";
+    const cls = st === "ok" ? "rc-ok" : st === "warn" ? "rc-warn" : st === "bad" ? "rc-bad" : "";
+    wrap.appendChild(h("span", { class: cls, text: label + glyph }));
+  };
+  const stOf = (view, judge) =>
+    view.key !== key
+      ? null
+      : view.loading
+      ? "pending"
+      : view.error
+      ? "bad"
+      : view.data
+      ? judge(view.data)
+      : null;
+  push(
+    "server",
+    stOf(serverView, (d) =>
+      computeDrift(d.raw, a).some((r) => r.verdict !== "same") ? "warn" : "ok"
+    )
+  );
+  push(
+    "robots",
+    stOf(robotsView, (d) =>
+      d.google && !d.google.allowed
+        ? "bad"
+        : d.sitemap && d.sitemap.scanned && !d.sitemap.found
+        ? "warn"
+        : "ok"
+    )
+  );
+  push("archive", stOf(waybackView, () => "ok"));
+  push(
+    siteView.key === key && siteView.data ? siteView.data.crawled + " pages" : "site",
+    stOf(siteView, (d) => (analyzeSite(d.pages).broken.length ? "warn" : "ok"))
+  );
+  push("field", stOf(psiView, (d) => (d.inp && d.inp.cat !== "FAST" ? "warn" : "ok")));
+  if (!wrap.children.length)
+    wrap.appendChild(
+      h("span", { text: "deep scan runs: server · robots · archive · site · field" })
+    );
+  return wrap;
+}
+
+function destinationHealth(dest, a) {
+  let worst = "green";
+  let issues = 0;
+  (dest.sections || []).forEach((s) => {
+    if (s.when && !s.when(a)) return;
+    let hr;
+    try {
+      hr = s.health(a) || {};
+    } catch {
+      hr = {};
+    }
+    if (hr.status === "red") worst = "red";
+    else if (hr.status === "amber" && worst !== "red") worst = "amber";
+    if (hr.status === "red" || hr.status === "amber") issues += hr.count || 1;
+  });
+  return { worst, issues };
+}
+
+function renderOverview(a) {
+  const out = [];
+  const key = normalizeUrl(a.url);
+  const sc = computeScore(a);
+  const prev = historyState && historyState.prev;
+  const delta = prev ? sc.score - snapScore(prev) : null;
+  const headline =
+    sc.crit > 0
+      ? {
+          cls: "is-red",
+          text: `${sc.crit} critical ${sc.crit === 1 ? "issue is" : "issues are"} blocking this page`,
+        }
+      : sc.warn > 0
+      ? { cls: "is-amber", text: `${sc.warn} warning${sc.warn > 1 ? "s" : ""} worth a look` }
+      : { cls: "is-green", text: "All clear — nothing needs you" };
+
+  // sparkline from the saved scans (oldest → newest)
+  let spark = null;
+  const list = (historyState && historyState.list) || [];
+  if (list.length >= 2) {
+    const pts = [...list].reverse().map(snapScore);
+    const w = 84;
+    const hgt = 30;
+    const step = w / (pts.length - 1);
+    const poly = pts
+      .map((v, i) => `${Math.round(i * step)},${Math.round(hgt - 3 - (v / 100) * (hgt - 6))}`)
+      .join(" ");
+    spark = h("span", {
+      class: "ov-spark",
+      html: `<svg width="${w}" height="${hgt}" viewBox="0 0 ${w} ${hgt}" aria-hidden="true"><polyline points="${poly}" fill="none" stroke="currentColor" stroke-width="2"/></svg>`,
+    });
+  }
+
+  const deepBtn = h("button", {
+    class: "linkcheck-run deep-btn",
+    type: "button",
+    text: deepScanState.running ? "Scanning…" : "Deep scan",
+  });
+  if (deepScanState.running) deepBtn.disabled = true;
+  deepBtn.addEventListener("click", () => runDeepScan(a));
+
+  out.push(
+    card(
+      null,
+      {},
+      h(
+        "div",
+        { class: "ov-score" },
+        h("span", { class: "ov-num", text: String(sc.score) }),
+        h(
+          "div",
+          { class: "ov-score-meta" },
+          h(
+            "div",
+            {},
+            delta != null && delta !== 0
+              ? pill(`${delta > 0 ? "▲ +" : "▼ "}${delta} vs last scan`, delta > 0 ? "green" : "red")
+              : pill(`${sc.pass}/${sc.total} checks pass`, "accent")
+          ),
+          h("div", { class: "ov-headline " + headline.cls, text: headline.text })
+        ),
+        spark
+      ),
+      deepBtn,
+      engineReceipts(a),
+      h("p", {
+        class: "note",
+        text: "Score = share of all checks passing. No secret weighting — fix a finding, the number moves.",
+      })
+    )
+  );
+
+  // findings filter (⌘K jumps here)
+  const filterInput = h("input", {
+    type: "text",
+    id: "ov-filter",
+    placeholder: "Filter findings…",
+    "aria-label": "Filter findings",
+    spellcheck: "false",
+  });
+  filterInput.addEventListener("input", () => {
+    const q = filterInput.value.trim().toLowerCase();
+    document.querySelectorAll(".ov-find").forEach((row) => {
+      row.style.display = !q || row.textContent.toLowerCase().includes(q) ? "" : "none";
+    });
+  });
+  out.push(
+    h(
+      "div",
+      { class: "ov-filter" },
+      h("span", { html: ICON.search }),
+      filterInput,
+      h("kbd", { text: "⌘K" })
+    )
+  );
+
+  // severity zones — problems take space, health takes one line
+  const T = computeTriage(a);
+  [
+    ["crit", "CRITICAL", "red", T.filter((f) => f.sev === "critical")],
+    ["warn", "WARNINGS", "amber", T.filter((f) => f.sev === "warning")],
+  ].forEach(([kind, label, band, items]) => {
+    if (!items.length) return;
+    const zone = card(null, {});
+    zone.classList.add("zone--" + kind);
+    zone.appendChild(
+      h("div", { class: "zone-label" }, h("span", { text: label }), h("span", { text: String(items.length) }))
+    );
+    items.forEach((f) => {
+      const row = h("div", { class: "ov-find" });
+      const t = h(
+        "div",
+        { class: "ov-find-t" },
+        h("span", {
+          class: "sev",
+          style: { color: band === "red" ? "var(--red)" : "var(--amber)" },
+          text: band === "red" ? "✕" : "▲",
+        }),
+        h("span", { style: { flex: "1", minWidth: "0" }, text: f.label })
+      );
+      const age = findingAge(f.label);
+      if (age) t.appendChild(pill(age.isNew ? "NEW" : `${age.scans} scans`, age.isNew ? "red" : "accent"));
+      row.appendChild(t);
+      if (f.detail) row.appendChild(h("div", { class: "ov-find-ev", text: f.detail }));
+      if (f.items && f.items.length) {
+        const listEl = h("div", { class: "triage-items" });
+        f.items.forEach((it) => {
+          const r = h(
+            "div",
+            { class: "triage-item", title: it.text },
+            h("span", { class: "triage-item-text", text: it.text })
+          );
+          attachHighlight(r, it.locator, truncate(it.text, 40));
+          listEl.appendChild(r);
+        });
+        row.appendChild(listEl);
+      }
+      zone.appendChild(row);
+    });
+    out.push(zone);
+  });
+
+  const passes = T.filter((f) => f.sev === "pass");
+  const passZone = card(null, {});
+  passZone.classList.add("zone--pass");
+  passZone.appendChild(
+    h(
+      "details",
+      {},
+      h(
+        "summary",
+        { class: "ov-pass-row" },
+        h("span", { style: { fontWeight: "800" }, text: "✓" }),
+        h("span", { style: { flex: "1" }, text: `${passes.length} passed — show` }),
+        h("span", { class: "sys-val is-green", text: sc.score + "%" })
+      ),
+      h("div", {}, passes.map((f) => checkRow({ status: "green", label: f.label, detail: f.detail })))
+    )
+  );
+  out.push(passZone);
+
+  // systems board — one cell per destination
+  const sys = h("div", { class: "sys-grid" });
+  DESTINATIONS.filter((d) => d.id !== "overview").forEach((d) => {
+    const hd = destinationHealth(d, a);
+    const val =
+      d.id === "compete" && !(competeView.key === key && competeView.data)
+        ? { cls: "", text: "run →" }
+        : d.id === "site" && !(siteView.key === key && siteView.data)
+        ? { cls: "", text: "run →" }
+        : hd.worst === "red"
+        ? { cls: "is-red", text: "✕ " + hd.issues }
+        : hd.worst === "amber"
+        ? { cls: "is-amber", text: "▲ " + hd.issues }
+        : { cls: "is-green", text: "✓" };
+    const cell = h(
+      "div",
+      { class: "sys-cell", role: "button", tabindex: "0" },
+      h("span", { text: d.label }),
+      h("span", { class: "sys-val " + val.cls, text: val.text })
+    );
+    const go = () => setActiveTab(d.id);
+    cell.addEventListener("click", go);
+    cell.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        go();
+      }
+    });
+    sys.appendChild(cell);
+  });
+  out.push(card("Systems", {}, sys));
+
+  // deep scan results strip (only engines that have answered)
+  const resRows = [];
+  if (serverView.key === key && serverView.data) {
+    const drifts = computeDrift(serverView.data.raw, a).filter((r) => r.verdict !== "same");
+    resRows.push({
+      st: drifts.length ? "amber" : "green",
+      label: drifts.length
+        ? `Server vs rendered — ${drifts.length} drift${drifts.length > 1 ? "s" : ""}`
+        : "Server vs rendered — no drift",
+      mono: "HTTP " + serverView.data.status,
+    });
+  }
+  if (robotsView.key === key && robotsView.data) {
+    const d = robotsView.data;
+    const blocked = d.google && !d.google.allowed;
+    resRows.push({
+      st: blocked ? "red" : "green",
+      label: blocked
+        ? "robots.txt — BLOCKED for Googlebot"
+        : "robots.txt — crawlable" +
+          (d.sitemap && d.sitemap.scanned ? (d.sitemap.found ? ", in sitemap" : ", NOT in sitemap") : ""),
+      mono: d.sitemaps && d.sitemaps.length ? d.sitemaps.length + " maps" : "",
+    });
+  }
+  if (psiView.key === key && psiView.data) {
+    const d = psiView.data;
+    const inpBad = d.inp && d.inp.cat !== "FAST";
+    resRows.push({
+      st: inpBad ? "amber" : "green",
+      label: inpBad ? "Real visitors — INP needs work" : "Real visitors — vitals healthy",
+      mono: d.inp ? fmtMs(d.inp.p75) : "",
+    });
+  }
+  if (waybackView.key === key && waybackView.data && !waybackView.data.never) {
+    const d = waybackView.data;
+    const ref = d.last && !d.last.failed ? d.last : d.first;
+    const changed = ref && !ref.failed && (ref.title || "").trim() !== (a.title || "").trim();
+    resRows.push({
+      st: changed ? "amber" : "green",
+      label: changed ? "Archive — title changed since capture" : "Archive — stable since capture",
+      mono: ref ? waybackTs(ref.ts) : "",
+    });
+  }
+  if (resRows.length) {
+    const body = h("div", {});
+    resRows.forEach((r) =>
+      body.appendChild(
+        h(
+          "div",
+          { class: "ov-res" },
+          statusDot(r.st),
+          h("span", { style: { flex: "1", minWidth: "0" }, text: r.label }),
+          r.mono ? h("span", { class: "mono", text: r.mono }) : null
+        )
+      )
+    );
+    out.push(card("Deep scan results", {}, body));
+  }
+
+  const since = renderSinceLast();
+  if (since) out.push(since);
+  out.push(renderHistoryList(a));
+  out.push(renderWayback(a));
+
+  out.push(
+    h(
+      "div",
+      { class: "ov-foot" },
+      h("span", {
+        text: `scan ${list.length || 1} · all local · nothing leaves this machine`,
+      }),
+      h("span", { class: "ravens" }, ravenSvg(13, false), ravenSvg(13, true))
+    )
+  );
+  return out;
+}
+
+/* ============================================================
    TAB REGISTRY (data-driven — add a tab here, shell untouched)
    ============================================================ */
-const TABS = [
-  { id: "triage", label: "Triage", count: (a) => computeTriage(a).filter((f) => f.sev !== "pass").length, render: renderTriage },
-  { id: "schema", label: "Schema", count: (a) => a.jsonLd.length, render: renderSchema },
-  { id: "readability", label: "Readability", count: (a) => computeReadability(a).overall, render: renderReadability },
-  { id: "content", label: "Content", count: (a) => { const ct = computeContent(a); return ct.fleschSkipped || ct.flesch == null ? null : ct.flesch; }, render: renderContent },
-  { id: "headings", label: "Headings", count: (a) => a.headings.length, render: renderHeadings },
-  { id: "links", label: "Links", count: (a) => a.links.length, render: renderLinks },
-  { id: "images", label: "Images", count: (a) => a.images.length, render: renderImages },
-  { id: "social", label: "Social", render: renderSocial },
-  { id: "eeat", label: "E-E-A-T", render: renderEeat },
-  { id: "performance", label: "Performance", render: renderPerformance },
-  { id: "technical", label: "Technical", render: renderTechnical },
-  { id: "server", label: "Server", render: renderServer },
-  { id: "site", label: "Site", render: renderSite },
-  { id: "compete", label: "Compete", render: renderCompete },
-  { id: "serp", label: "SERP X-Ray", when: (a) => isGoogleSerp(a.url), count: (a) => (a.serp && a.serp.results && a.serp.results.length ? a.serp.results.length : null), render: renderSerpXray },
-  { id: "a11y", label: "Accessibility", count: (a) => computeA11y(a).filter((c) => c.status !== "green").length, render: renderA11y },
+/* ============================================================
+   DESTINATIONS — five places instead of sixteen tabs. Former
+   tabs live on as collapsible sections: healthy = one summary
+   line, problems auto-open. Bodies render lazily on first open.
+   ============================================================ */
+function hContent(a) {
+  const ct = computeContent(a);
+  const thin = (ct.wordCount || 0) < 300;
+  return {
+    status: thin ? "amber" : "green",
+    summary: `${ct.wordCount} words${ct.fleschSkipped ? "" : ct.flesch != null ? ` · Flesch ${ct.flesch}` : ""}`,
+    count: thin ? 1 : 0,
+  };
+}
+function hReadability(a) {
+  const r = computeReadability(a);
+  return { status: scoreBand(r.overall), summary: r.overall + "/100", count: r.overall < 80 ? 1 : 0 };
+}
+function hHeadings(a) {
+  const f = headingFlags(a.headings || []);
+  const issues = (f.noH1 ? 1 : 0) + (f.multipleH1 ? 1 : 0) + (f.skips ? 1 : 0) + (f.empties ? 1 : 0);
+  return {
+    status: f.noH1 ? "red" : issues ? "amber" : "green",
+    summary: issues ? `${issues} issue${issues > 1 ? "s" : ""}` : `${(a.headings || []).length} headings · clean`,
+    count: issues,
+  };
+}
+function hEeat(a) {
+  const e = extractEeat(a);
+  const miss = (!e.authorName ? 1 : 0) + (!e.datePublished ? 1 : 0) + (!e.orgName && !e.hasPublisher ? 1 : 0);
+  return { status: miss >= 2 ? "amber" : "green", summary: e.authorName || "no author signal", count: miss };
+}
+function hTechnical(a) {
+  const noindexed = /\b(?:noindex|none)\b/i.test(`${a.robotsMeta || ""} ${a.googlebotMeta || ""}`);
+  const canonSelf = !!a.canonical && normalizeForCompare(a.canonical) === normalizeForCompare(a.url);
+  const issues =
+    (noindexed ? 1 : 0) +
+    (!a.title ? 1 : 0) +
+    (!a.metaDescription ? 1 : 0) +
+    (a.canonical && !canonSelf ? 1 : 0) +
+    computeHreflangIssues(a).length +
+    (a.mixedContent && a.mixedContent.count ? 1 : 0);
+  return {
+    status: noindexed || !a.title ? "red" : issues ? "amber" : "green",
+    summary: noindexed ? "noindexed!" : issues ? `${issues} to review` : "indexable · tags sane",
+    count: issues,
+  };
+}
+function hSchema(a) {
+  const issues = computeSchemaIssues(a);
+  const errs = (a.jsonLdErrors || []).length;
+  const types = new Set();
+  (a.jsonLd || []).forEach((b) => collectTypes(b, types));
+  const red = errs > 0 || issues.some((i) => i.status === "red");
+  return {
+    status: red ? "red" : issues.length ? "amber" : (a.jsonLd || []).length ? "green" : "amber",
+    summary: `${types.size} type${types.size === 1 ? "" : "s"} · ${issues.length} issue${issues.length === 1 ? "" : "s"}`,
+    count: issues.length + errs,
+  };
+}
+function hServer(a) {
+  const key = normalizeUrl(a.url);
+  if (serverView.key !== key || !serverView.data)
+    return {
+      status: "neutral",
+      summary: serverView.key === key && serverView.loading ? "fetching…" : "part of Deep scan",
+      count: 0,
+    };
+  const drifts = computeDrift(serverView.data.raw, a).filter((r) => r.verdict !== "same");
+  return {
+    status: drifts.length ? "amber" : "green",
+    summary: drifts.length ? `${drifts.length} drift${drifts.length > 1 ? "s" : ""}` : "no drift",
+    count: drifts.length,
+  };
+}
+function hLinks(a) {
+  const links = a.links || [];
+  const broken = links.filter((l) => l.fragBroken).length;
+  const empty = links.filter((l) => !l.anchor).length;
+  const ph = links.filter((l) => {
+    const r = (l.rawHref || "").trim();
+    return r === "" || r === "#" || /^javascript:/i.test(r);
+  }).length;
+  const issues = (broken ? 1 : 0) + (empty ? 1 : 0) + (ph ? 1 : 0);
+  return {
+    status: issues ? "amber" : "green",
+    summary: `${links.length} links${issues ? ` · ${issues} flag${issues > 1 ? "s" : ""}` : " · clean"}`,
+    count: issues,
+  };
+}
+function hImages(a) {
+  const imgs = a.images || [];
+  const noAlt = imgs.filter((i) => !i.hasAlt).length;
+  return {
+    status: noAlt > 3 ? "red" : noAlt ? "amber" : "green",
+    summary: noAlt ? `${noAlt}/${imgs.length} missing alt` : `${imgs.length} images · alt OK`,
+    count: noAlt,
+  };
+}
+function hSocial(a) {
+  const og = a.openGraph || {};
+  const missing = ["og:title", "og:description", "og:image"].filter((f) => !og[f]).length;
+  return {
+    status: missing ? "amber" : "green",
+    summary: missing ? `${missing} OG field${missing > 1 ? "s" : ""} missing` : "preview ready",
+    count: missing,
+  };
+}
+function hPerformance(a) {
+  const p = a.performance || {};
+  const lb = band(p.lcp, 2500, 4000);
+  const cb = band(p.cls, 0.1, 0.25);
+  const bad = (lb === "red" ? 1 : 0) + (cb === "red" ? 1 : 0);
+  const warn = (lb === "amber" ? 1 : 0) + (cb === "amber" ? 1 : 0);
+  return {
+    status: bad ? "red" : warn ? "amber" : p.lcp == null ? "neutral" : "green",
+    summary:
+      p.lcp == null ? "no paint data this load" : `LCP ${fmtMs(p.lcp)} · CLS ${p.cls == null ? "—" : p.cls.toFixed(2)}`,
+    count: bad + warn,
+  };
+}
+function hA11y(a) {
+  const bad = computeA11y(a).filter((c) => c.status === "red" || c.status === "amber").length;
+  return {
+    status: bad > 3 ? "red" : bad ? "amber" : "green",
+    summary: bad ? `${bad} check${bad > 1 ? "s" : ""} flagged` : "quick checks pass",
+    count: bad,
+  };
+}
+function hCompete(a) {
+  const key = normalizeUrl(a.url);
+  return competeView.key === key && competeView.data
+    ? {
+        status: competeView.data.gap && competeView.data.gap.length ? "amber" : "green",
+        summary: `${(competeView.data.gap || []).length} term gaps`,
+        count: (competeView.data.gap || []).length,
+      }
+    : { status: "neutral", summary: "paste rivals to run", count: 0 };
+}
+function hSerp(a) {
+  return {
+    status: "neutral",
+    summary: `${((a.serp || {}).results || []).length} results read`,
+    count: 0,
+  };
+}
+function hSite(a) {
+  const key = normalizeUrl(a.url);
+  if (siteView.key === key && siteView.data) {
+    const an = analyzeSite(siteView.data.pages);
+    const issues = an.dupTitles.length + an.noindexed.length + an.broken.length;
+    return {
+      status: issues ? "amber" : "green",
+      summary: `${siteView.data.crawled} crawled · ${issues} issue${issues === 1 ? "" : "s"}`,
+      count: issues,
+    };
+  }
+  return { status: "neutral", summary: "part of Deep scan", count: 0 };
+}
+
+const DESTINATIONS = [
+  { id: "overview", label: "Overview", render: renderOverview },
+  {
+    id: "page",
+    label: "Page",
+    sections: [
+      { id: "content", label: "Content & keywords", health: hContent, render: renderContent },
+      { id: "readability", label: "LLM readability", health: hReadability, render: renderReadability },
+      { id: "headings", label: "Headings", health: hHeadings, render: renderHeadings },
+      { id: "eeat", label: "E-E-A-T signals", health: hEeat, render: renderEeat },
+    ],
+  },
+  {
+    id: "tech",
+    label: "Tech",
+    sections: [
+      { id: "technical", label: "Indexing & meta", health: hTechnical, render: renderTechnical },
+      { id: "schema", label: "Schema", health: hSchema, render: renderSchema },
+      { id: "server", label: "Server view", health: hServer, render: renderServer },
+      { id: "links", label: "Links", health: hLinks, render: renderLinks },
+      { id: "images", label: "Images", health: hImages, render: renderImages },
+      { id: "social", label: "Social preview", health: hSocial, render: renderSocial },
+      { id: "performance", label: "Performance", health: hPerformance, render: renderPerformance },
+      { id: "a11y", label: "Accessibility", health: hA11y, render: renderA11y },
+    ],
+  },
+  {
+    id: "compete",
+    label: "Compete",
+    sections: [
+      { id: "serp", label: "SERP X-Ray", when: (a) => isGoogleSerp(a.url), health: hSerp, render: renderSerpXray, forceOpen: true },
+      { id: "compete-s", label: "Competitor gap", health: hCompete, render: renderCompete, forceOpen: true },
+    ],
+  },
+  {
+    id: "site",
+    label: "Site",
+    sections: [{ id: "site-s", label: "Site sample & bulk", health: hSite, render: renderSite, forceOpen: true }],
+  },
 ];
+
+function sectionEl(s, a) {
+  let hres;
+  try {
+    hres = s.health(a) || {};
+  } catch {
+    hres = { status: "neutral", summary: "" };
+  }
+  const open = !!s.forceOpen || hres.status === "red" || hres.status === "amber";
+  const d = h("details", { class: "sec" });
+  if (open) d.open = true;
+  const glyph =
+    hres.status === "red" ? "✕" : hres.status === "amber" ? "▲" : hres.status === "green" ? "✓" : "·";
+  d.appendChild(
+    h(
+      "summary",
+      { class: "sec-head" },
+      h("span", { class: "sec-glyph is-" + (hres.status || "neutral"), text: glyph }),
+      h("span", { class: "sec-title", text: s.label }),
+      h("span", { class: "sec-sum", text: hres.summary || "" }),
+      h("span", { class: "sec-chev", text: "›" })
+    )
+  );
+  const body = h("div", { class: "sec-body" });
+  let rendered = false;
+  const fill = () => {
+    if (rendered) return;
+    rendered = true;
+    let nodes;
+    try {
+      nodes = s.render(a) || [];
+    } catch (e) {
+      nodes = [h("p", { class: "muted", text: "Failed to render: " + e.message })];
+    }
+    nodes.forEach((n) => body.appendChild(n));
+  };
+  if (open) fill();
+  d.addEventListener("toggle", () => {
+    if (d.open) fill();
+  });
+  d.appendChild(body);
+  return d;
+}
+
+function renderDestination(dest, a) {
+  return (dest.sections || []).filter((s) => !s.when || s.when(a)).map((s) => sectionEl(s, a));
+}
 
 /* ============================================================
    TAB: Schema (hero)
@@ -4287,6 +4919,68 @@ let psiView = { key: null, loading: false, data: null, error: null };
 
 const PSI_BAND = { FAST: "green", AVERAGE: "amber", SLOW: "red" };
 
+async function runPsiScan(a) {
+  const key = normalizeUrl(a.url);
+  psiView = { key, loading: true, data: null, error: null };
+  if (panelState === "ready") renderActiveTab();
+  let psiKey = "";
+  try {
+    psiKey = (localStorage.getItem("seodin.psiKey") || "").trim();
+  } catch {}
+  const res = await fetchText(
+    "https://www.googleapis.com/pagespeedonline/v5/runPagespeed?strategy=mobile&category=performance&url=" +
+      encodeURIComponent(a.url) +
+      (psiKey ? "&key=" + encodeURIComponent(psiKey) : ""),
+    60000
+  );
+  if (!res.ok) {
+    psiView = {
+      key,
+      loading: false,
+      data: null,
+      error:
+        res.status === 429 || res.status === 403
+          ? psiKey
+            ? "Rate-limited even with your key — wait a minute and retry."
+            : "Rate-limited — Google's keyless quota is nearly zero these days. Add a free API key below (stays on this machine)."
+          : res.failed
+          ? res.timeout
+            ? "Timed out — Lighthouse runs take a while; retry."
+            : "Network failure."
+          : `HTTP ${res.status}`,
+    };
+    if (panelState === "ready") renderActiveTab();
+    return;
+  }
+  try {
+    const json = JSON.parse(res.text);
+    const le = json.loadingExperience || {};
+    const m = le.metrics || {};
+    const pick = (k) => (m[k] ? { p75: m[k].percentile, cat: m[k].category } : null);
+    psiView = {
+      key,
+      loading: false,
+      error: null,
+      data: {
+        fallback: !!le.origin_fallback,
+        lcp: pick("LARGEST_CONTENTFUL_PAINT_MS"),
+        inp: pick("INTERACTION_TO_NEXT_PAINT"),
+        cls: pick("CUMULATIVE_LAYOUT_SHIFT_SCORE"),
+        score:
+          json.lighthouseResult &&
+          json.lighthouseResult.categories &&
+          json.lighthouseResult.categories.performance &&
+          json.lighthouseResult.categories.performance.score != null
+            ? Math.round(json.lighthouseResult.categories.performance.score * 100)
+            : null,
+      },
+    };
+  } catch {
+    psiView = { key, loading: false, data: null, error: "Unexpected response." };
+  }
+  if (panelState === "ready") renderActiveTab();
+}
+
 function renderPsi(a) {
   const key = normalizeUrl(a.url);
   const btn = h("button", {
@@ -4294,67 +4988,7 @@ function renderPsi(a) {
     type: "button",
     text: psiView.key === key && psiView.data ? "Fetch again" : "Fetch real-world data (Google PSI)",
   });
-  const run = async () => {
-    psiView = { key, loading: true, data: null, error: null };
-    renderActiveTab();
-    let psiKey = "";
-    try {
-      psiKey = (localStorage.getItem("seodin.psiKey") || "").trim();
-    } catch {}
-    const res = await fetchText(
-      "https://www.googleapis.com/pagespeedonline/v5/runPagespeed?strategy=mobile&category=performance&url=" +
-        encodeURIComponent(a.url) +
-        (psiKey ? "&key=" + encodeURIComponent(psiKey) : ""),
-      60000
-    );
-    if (!res.ok) {
-      psiView = {
-        key,
-        loading: false,
-        data: null,
-        error:
-          res.status === 429 || res.status === 403
-            ? psiKey
-              ? "Rate-limited even with your key — wait a minute and retry."
-              : "Rate-limited — Google's keyless quota is nearly zero these days. Add a free API key below (stays on this machine)."
-            : res.failed
-            ? res.timeout
-              ? "Timed out — Lighthouse runs take a while; retry."
-              : "Network failure."
-            : `HTTP ${res.status}`,
-      };
-      renderActiveTab();
-      return;
-    }
-    try {
-      const json = JSON.parse(res.text);
-      const le = json.loadingExperience || {};
-      const m = le.metrics || {};
-      const pick = (k) => (m[k] ? { p75: m[k].percentile, cat: m[k].category } : null);
-      psiView = {
-        key,
-        loading: false,
-        error: null,
-        data: {
-          fallback: !!le.origin_fallback,
-          lcp: pick("LARGEST_CONTENTFUL_PAINT_MS"),
-          inp: pick("INTERACTION_TO_NEXT_PAINT"),
-          cls: pick("CUMULATIVE_LAYOUT_SHIFT_SCORE"),
-          score:
-            json.lighthouseResult &&
-            json.lighthouseResult.categories &&
-            json.lighthouseResult.categories.performance &&
-            json.lighthouseResult.categories.performance.score != null
-              ? Math.round(json.lighthouseResult.categories.performance.score * 100)
-              : null,
-        },
-      };
-    } catch {
-      psiView = { key, loading: false, data: null, error: "Unexpected response." };
-    }
-    renderActiveTab();
-  };
-  btn.addEventListener("click", run);
+  btn.addEventListener("click", () => runPsiScan(a));
 
   const bits = [
     h("p", {
@@ -4391,7 +5025,7 @@ function renderPsi(a) {
           try {
             localStorage.setItem("seodin.psiKey", keyInput.value.trim());
           } catch {}
-          run();
+          runPsiScan(a);
         });
         bits.push(keyInput, saveBtn);
         bits.push(
@@ -5140,6 +5774,30 @@ async function checkSitemaps(sitemapUrls, targetUrl) {
   return { scanned, urlCount, found, skippedGz, exhausted: fetches <= 0 || bytes <= 0 };
 }
 
+async function runRobotsScan(a) {
+  const key = normalizeUrl(a.url);
+  robotsView = { key, loading: true, data: null, error: null };
+  if (panelState === "ready") renderActiveTab();
+  const res = await fetchText(a.origin + "/robots.txt", 10000);
+  const data = { robotsStatus: res.status, robotsFailed: !!res.failed };
+  if (res.ok) {
+    const parsed = parseRobots(res.text);
+    data.hasRobots = true;
+    data.sitemaps = parsed.sitemaps;
+    data.google = evaluateRobots(parsed, a.url, "googlebot");
+    data.star = evaluateRobots(parsed, a.url, "*");
+  } else {
+    data.hasRobots = false;
+    data.sitemaps = [];
+  }
+  const smUrls = data.sitemaps.length ? data.sitemaps : [a.origin + "/sitemap.xml"];
+  data.sitemapGuessed = !data.sitemaps.length;
+  data.sitemapUrls = smUrls;
+  data.sitemap = await checkSitemaps(smUrls, a.url);
+  robotsView = { key, loading: false, data, error: null };
+  if (panelState === "ready") renderActiveTab();
+}
+
 function renderCrawlability(a) {
   const key = normalizeUrl(a.url);
   const btn = h("button", {
@@ -5150,28 +5808,7 @@ function renderCrawlability(a) {
         ? "Check again"
         : "Check robots.txt & sitemap",
   });
-  btn.addEventListener("click", async () => {
-    robotsView = { key, loading: true, data: null, error: null };
-    renderActiveTab();
-    const res = await fetchText(a.origin + "/robots.txt", 10000);
-    const data = { robotsStatus: res.status, robotsFailed: !!res.failed };
-    if (res.ok) {
-      const parsed = parseRobots(res.text);
-      data.hasRobots = true;
-      data.sitemaps = parsed.sitemaps;
-      data.google = evaluateRobots(parsed, a.url, "googlebot");
-      data.star = evaluateRobots(parsed, a.url, "*");
-    } else {
-      data.hasRobots = false;
-      data.sitemaps = [];
-    }
-    const smUrls = data.sitemaps.length ? data.sitemaps : [a.origin + "/sitemap.xml"];
-    data.sitemapGuessed = !data.sitemaps.length;
-    data.sitemapUrls = smUrls;
-    data.sitemap = await checkSitemaps(smUrls, a.url);
-    robotsView = { key, loading: false, data, error: null };
-    renderActiveTab();
-  });
+  btn.addEventListener("click", () => runRobotsScan(a));
 
   const bits = [
     h("p", {
@@ -5414,6 +6051,29 @@ function computeDrift(raw, a) {
   return rows;
 }
 
+async function runServerScan(a) {
+  const key = normalizeUrl(a.url);
+  serverView = { key, loading: true, data: null, error: null };
+  if (panelState === "ready") renderActiveTab();
+  const res = await fetchServerView(a.url);
+  serverView = res.ok
+    ? {
+        key,
+        loading: false,
+        error: null,
+        data: {
+          status: res.status,
+          redirected: res.redirected,
+          finalUrl: res.finalUrl,
+          headers: res.headers,
+          raw: parseRawHtml(res.html, res.finalUrl || a.url),
+          htmlBytes: res.html.length,
+        },
+      }
+    : { key, loading: false, data: null, error: res.message };
+  if (panelState === "ready") renderActiveTab();
+}
+
 function renderServer(a) {
   const out = [];
   const key = normalizeUrl(a.url);
@@ -5423,27 +6083,7 @@ function renderServer(a) {
     type: "button",
     text: serverView.key === key && serverView.data ? "Fetch again" : "Fetch from server",
   });
-  btn.addEventListener("click", async () => {
-    serverView = { key, loading: true, data: null, error: null };
-    renderActiveTab();
-    const res = await fetchServerView(a.url);
-    serverView = res.ok
-      ? {
-          key,
-          loading: false,
-          error: null,
-          data: {
-            status: res.status,
-            redirected: res.redirected,
-            finalUrl: res.finalUrl,
-            headers: res.headers,
-            raw: parseRawHtml(res.html, res.finalUrl || a.url),
-            htmlBytes: res.html.length,
-          },
-        }
-      : { key, loading: false, data: null, error: res.message };
-    renderActiveTab();
-  });
+  btn.addEventListener("click", () => runServerScan(a));
 
   out.push(
     card(
@@ -5713,6 +6353,41 @@ function analyzeSite(pages) {
   };
 }
 
+async function runSiteScan(a) {
+  const key = normalizeUrl(a.url);
+  const targets = siteCrawlTargets(a);
+  if (!targets.length) {
+    siteView = { key, loading: false, error: null, data: { pages: [], crawled: 0 } };
+    if (panelState === "ready") renderActiveTab();
+    return;
+  }
+  siteView = { key, loading: true, data: null, error: null };
+  if (panelState === "ready") renderActiveTab();
+  try {
+    const pages = await runPool(targets, auditUrlLite, 5, () => {});
+    // the current page joins the comparison set from its own (rendered) audit
+    const thisPage = {
+      url: a.url,
+      status: null,
+      thisPage: true,
+      title: a.title || "",
+      description: a.metaDescription || "",
+      canonical: a.canonical,
+      noindex: /\b(?:noindex|none)\b/i.test(`${a.robotsMeta || ""} ${a.googlebotMeta || ""}`),
+      h1Count: (a.headings || []).filter((x) => x.level === 1).length,
+    };
+    siteView = {
+      key,
+      loading: false,
+      error: null,
+      data: { pages: [thisPage, ...pages], crawled: pages.length },
+    };
+  } catch (e) {
+    siteView = { key, loading: false, data: null, error: (e && e.message) || "Crawl failed." };
+  }
+  if (panelState === "ready") renderActiveTab();
+}
+
 function renderSite(a) {
   const out = [];
   const key = normalizeUrl(a.url);
@@ -5727,47 +6402,7 @@ function renderSite(a) {
   });
   if (!targets.length) btn.disabled = true;
 
-  const progress = h("div", {});
-  btn.addEventListener("click", async () => {
-    btn.disabled = true;
-    siteView = { key, loading: true, data: null, error: null };
-    progress.textContent = "";
-    const statusEl = h(
-      "div",
-      { class: "linkcheck-status" },
-      h("span", { class: "linkcheck-spinner" }),
-      h("span", { text: `Crawling… 0 / ${targets.length}` })
-    );
-    progress.appendChild(statusEl);
-    const label = statusEl.lastChild;
-    try {
-      let done = 0;
-      const pages = await runPool(targets, auditUrlLite, 5, () => {
-        done++;
-        label.textContent = `Crawling… ${done} / ${targets.length}`;
-      });
-      // the current page joins the comparison set from its own (rendered) audit
-      const thisPage = {
-        url: a.url,
-        status: null,
-        thisPage: true,
-        title: a.title || "",
-        description: a.metaDescription || "",
-        canonical: a.canonical,
-        noindex: /\b(?:noindex|none)\b/i.test(`${a.robotsMeta || ""} ${a.googlebotMeta || ""}`),
-        h1Count: (a.headings || []).filter((x) => x.level === 1).length,
-      };
-      siteView = {
-        key,
-        loading: false,
-        error: null,
-        data: { pages: [thisPage, ...pages], crawled: pages.length },
-      };
-    } catch (e) {
-      siteView = { key, loading: false, data: null, error: (e && e.message) || "Crawl failed." };
-    }
-    renderActiveTab();
-  });
+  btn.addEventListener("click", () => runSiteScan(a));
 
   out.push(
     card(
@@ -5777,8 +6412,7 @@ function renderSite(a) {
         class: "note",
         text: `Fetches up to ${SITE_CRAWL_CAP} pages this page links to (raw HTML, anonymous, no JavaScript) and hunts the classic cross-page issues: duplicate titles and descriptions, missing tags, noindexed or broken pages.`,
       }),
-      btn,
-      progress
+      btn
     )
   );
 
@@ -6322,9 +6956,8 @@ function renderSerpXray(a) {
 /* ============================================================
    shell: tab bar, content, states
    ============================================================ */
-// Tabs may declare when(audit) — e.g. SERP X-Ray only on a Google results page.
 function visibleTabs() {
-  return TABS.filter((t) => !t.when || (currentAudit && t.when(currentAudit)));
+  return DESTINATIONS;
 }
 
 function buildTabBar() {
@@ -6382,11 +7015,11 @@ function setActiveTab(id) {
 
 function renderActiveTab() {
   if (panelState !== "ready") return;
-  const tab = visibleTabs().find((t) => t.id === currentTabId) || TABS[0];
+  const tab = visibleTabs().find((t) => t.id === currentTabId) || DESTINATIONS[0];
   const panel = h("div", { class: "tab-panel" });
   let nodes;
   try {
-    nodes = tab.render(currentAudit) || [];
+    nodes = tab.render ? tab.render(currentAudit) || [] : renderDestination(tab, currentAudit);
   } catch (e) {
     console.error("SEOdin render error", e);
     nodes = [card("Error", {}, h("p", { class: "muted", text: "Failed to render this tab: " + e.message }))];
@@ -6426,6 +7059,8 @@ function showLoading() {
 /* ============================================================
    header
    ============================================================ */
+// The header wordmark stays "SEOdin" — the page identifies itself via favicon
+// and URL line (the wordmark is the brand, not the page).
 function updateHeader(tab) {
   if (tab && tab.favIconUrl) {
     els.favicon.src = tab.favIconUrl;
@@ -6433,11 +7068,9 @@ function updateHeader(tab) {
   } else {
     els.favicon.removeAttribute("src");
   }
-  if (tab && tab.title) els.pageTitle.textContent = tab.title;
   if (tab && tab.url) els.pageUrl.textContent = tab.url;
 }
 function updateHeaderFromAudit(a) {
-  if (a.title) els.pageTitle.textContent = a.title;
   if (a.url) els.pageUrl.textContent = a.url;
   if (!els.favicon.getAttribute("src") && a.faviconUrl) {
     els.favicon.src = a.faviconUrl;
@@ -6597,9 +7230,9 @@ async function runAudit() {
     updateHeaderFromAudit(currentAudit);
     await applyHistory(currentAudit); // Feature 2 — record + diff (local only)
     if (superseded()) return;
-    // On a Google results page, jump straight to SERP X-Ray — but only from
-    // the default tab, never fighting the user's own tab choice.
-    if (isGoogleSerp(currentAudit.url) && currentTabId === "triage") currentTabId = "serp";
+    // On a Google results page, jump straight to Compete (where the SERP
+    // X-Ray section lives) — only from the default, never fighting the user.
+    if (isGoogleSerp(currentAudit.url) && currentTabId === "overview") currentTabId = "compete";
     buildTabBar();
     renderActiveTab();
   } finally {
@@ -7157,6 +7790,22 @@ els.copyBtn.addEventListener("click", copyForLLM);
 // A 404ing favicon shouldn't sit in the header as a broken-image glyph.
 els.favicon.addEventListener("error", () => {
   els.favicon.style.visibility = "hidden";
+});
+
+// Honesty notes collapse to one ⓘ line — tap to expand, word for word intact.
+els.content.addEventListener("click", (e) => {
+  const n = e.target.closest(".note");
+  if (n && els.content.contains(n)) n.classList.toggle("is-open");
+});
+
+// ⌘K / Ctrl+K — jump to the Overview findings filter.
+document.addEventListener("keydown", (e) => {
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+    e.preventDefault();
+    if (currentTabId !== "overview") setActiveTab("overview");
+    const f = document.getElementById("ov-filter");
+    if (f) f.focus();
+  }
 });
 
 /* ---- theme (manual light/dark, remembered; defaults to system) ---- */
