@@ -116,6 +116,13 @@ const VERSION = (() => {
 let currentAudit = null;
 let currentTabId = "overview";
 let panelState = "loading"; // loading | ready | restricted | error
+// Which tab the content area currently shows. Lets renderActiveTab tell a genuine
+// tab switch (reset scroll to top) apart from an in-place re-render (keep position).
+let lastRenderedTabId = null;
+// Remembers which collapsible sections the user has opened/closed (keyed by section
+// id) so an in-place re-render doesn't snap them back to their health-default state.
+// Reset per audit so a new page still auto-opens its problem sections.
+let secOpen = {};
 let activeBrowserTab = null;
 const viewModes = { schema: "tree" }; // per-card view toggles
 
@@ -3878,8 +3885,9 @@ function renderOverview(a) {
    ============================================================ */
 /* ============================================================
    DESTINATIONS — five places instead of sixteen tabs. Former
-   tabs live on as collapsible sections: healthy = one summary
-   line, problems auto-open. Bodies render lazily on first open.
+   tabs live on as collapsible sections, all collapsed by default;
+   problems are flagged on the header (severity wash + left bar +
+   count chip), not auto-opened. Bodies render lazily on first open.
    ============================================================ */
 function hContent(a) {
   const ct = computeContent(a);
@@ -4084,18 +4092,30 @@ function sectionEl(s, a) {
   } catch {
     hres = { status: "neutral", summary: "" };
   }
-  const open = !!s.forceOpen || hres.status === "red" || hres.status === "amber";
-  const d = h("details", { class: "sec" });
+  // Sections no longer auto-open on problems — that buried the page under long
+  // bodies. A flagged section is marked on its collapsed header instead (severity
+  // wash + left bar + count chip). Only forceOpen (interactive) sections start open.
+  const def = !!s.forceOpen;
+  const open = s.id in secOpen ? secOpen[s.id] : def;
+  const flag = hres.status === "red" || hres.status === "amber"; // needs attention
+  const d = h("details", { class: "sec" + (flag ? " sec--flag is-" + hres.status : ""), "data-sec-id": s.id });
   if (open) d.open = true;
   const glyph =
     hres.status === "red" ? "✕" : hres.status === "amber" ? "▲" : hres.status === "green" ? "✓" : "·";
+  // On a flagged section show a bold count chip; otherwise the quiet summary line.
+  const sum = h("span", { class: "sec-sum" });
+  if (flag && hres.count > 0) {
+    sum.appendChild(h("span", { class: "sec-count is-" + hres.status, text: String(hres.count) }));
+  } else {
+    sum.textContent = hres.summary || "";
+  }
   d.appendChild(
     h(
       "summary",
       { class: "sec-head" },
       h("span", { class: "sec-glyph is-" + (hres.status || "neutral"), text: glyph }),
       h("span", { class: "sec-title", text: s.label }),
-      h("span", { class: "sec-sum", text: hres.summary || "" }),
+      sum,
       h("span", { class: "sec-chev", text: "›" })
     )
   );
@@ -4114,6 +4134,7 @@ function sectionEl(s, a) {
   };
   if (open) fill();
   d.addEventListener("toggle", () => {
+    secOpen[s.id] = d.open;
     if (d.open) fill();
   });
   d.appendChild(body);
@@ -7201,8 +7222,33 @@ function setActiveTab(id) {
 
 function renderActiveTab() {
   if (panelState !== "ready") return;
+  // Snapshot collapsible-section open/closed state straight from the live DOM, so an
+  // in-place rebuild restores exactly what the user has expanded. Reading the DOM is
+  // timing-independent — it doesn't depend on the async <details> toggle event firing.
+  els.content.querySelectorAll("details.sec[data-sec-id]").forEach((d) => {
+    secOpen[d.dataset.secId] = d.open;
+  });
+  // An in-place re-render of the SAME tab (e.g. an async scan finished) should
+  // keep the user where they scrolled and keep their keyboard focus; only a real
+  // tab switch or fresh audit (different tab id) resets to the top.
+  const sameTab = lastRenderedTabId === currentTabId;
+  const savedScroll = els.content.scrollTop;
+  let focusSnap = null;
+  const active = document.activeElement;
+  if (sameTab && active && active.id && els.content.contains(active)) {
+    focusSnap = { id: active.id };
+    try {
+      if ("selectionStart" in active) {
+        focusSnap.start = active.selectionStart;
+        focusSnap.end = active.selectionEnd;
+      }
+    } catch {}
+  }
+
   const tab = visibleTabs().find((t) => t.id === currentTabId) || DESTINATIONS[0];
-  const panel = h("div", { class: "tab-panel" });
+  // Only play the fade-in on a real tab switch. On an in-place re-render (an async
+  // feature updating) replaying it flashes the whole panel — that's the flicker.
+  const panel = h("div", { class: "tab-panel" + (sameTab ? " no-fade" : "") });
   let nodes;
   try {
     nodes = tab.render ? tab.render(currentAudit) || [] : renderDestination(tab, currentAudit);
@@ -7213,12 +7259,25 @@ function renderActiveTab() {
   nodes.forEach((n) => panel.appendChild(n));
   els.content.textContent = "";
   els.content.appendChild(panel);
-  els.content.scrollTop = 0;
+  els.content.scrollTop = sameTab ? savedScroll : 0;
+
+  if (focusSnap) {
+    const el = document.getElementById(focusSnap.id);
+    if (el) {
+      el.focus({ preventScroll: true });
+      try {
+        if (focusSnap.start != null && "setSelectionRange" in el) el.setSelectionRange(focusSnap.start, focusSnap.end);
+      } catch {}
+    }
+  }
+
+  lastRenderedTabId = currentTabId;
 }
 
 /* ----- states ----- */
 function showState(kind, { title, sub, iconKey } = {}) {
   panelState = kind;
+  lastRenderedTabId = null; // next real render starts at the top
   els.content.textContent = "";
   const wrap = h(
     "div",
@@ -7232,6 +7291,8 @@ function showState(kind, { title, sub, iconKey } = {}) {
 
 function showLoading() {
   panelState = "loading";
+  lastRenderedTabId = null; // fresh audit lands at the top
+  secOpen = {}; // new page: let health defaults decide which sections auto-open
   els.content.textContent = "";
   const wrap = h(
     "div",

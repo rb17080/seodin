@@ -438,6 +438,11 @@ body::before {
   gap: 10px;
   animation: fadein 120ms ease;
 }
+/* In-place re-renders (async feature finished) skip the fade so the panel
+   doesn't flash; only genuine tab switches animate. */
+.tab-panel.no-fade {
+  animation: none;
+}
 @keyframes fadein {
   from {
     opacity: 0;
@@ -2627,6 +2632,39 @@ body::before {
 }
 .sec-glyph.is-red {
   color: var(--red);
+}
+/* Flagged sections — flat severity cues so a collapsed section still shows it
+   needs attention (replaces the old auto-open behaviour). */
+.sec.is-red {
+  border-left: 3px solid var(--red);
+}
+.sec.is-amber {
+  border-left: 3px solid var(--amber);
+}
+.sec.is-red > .sec-head,
+.sec.is-red > .sec-head:hover {
+  background: var(--red-soft);
+}
+.sec.is-amber > .sec-head,
+.sec.is-amber > .sec-head:hover {
+  background: var(--amber-soft);
+}
+.sec-count {
+  display: inline-block;
+  border-radius: 7px;
+  padding: 1px 8px;
+  font-family: var(--font-display);
+  font-weight: 800;
+  font-size: 11px;
+  letter-spacing: 0.02em;
+}
+.sec-count.is-red {
+  background: var(--red);
+  color: var(--bg-card);
+}
+.sec-count.is-amber {
+  background: var(--amber);
+  color: var(--bg-card);
 }
 .sec-title {
   font-family: var(--font-display);
