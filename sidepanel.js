@@ -120,8 +120,8 @@ let panelState = "loading"; // loading | ready | restricted | error
 // tab switch (reset scroll to top) apart from an in-place re-render (keep position).
 let lastRenderedTabId = null;
 // Remembers which collapsible sections the user has opened/closed (keyed by section
-// id) so an in-place re-render doesn't snap them back to their health-default state.
-// Reset per audit so a new page still auto-opens its problem sections.
+// id) so an in-place re-render keeps them as the user left them. Reset per audit so
+// each new page starts fresh — all sections collapsed except forceOpen ones.
 let secOpen = {};
 let activeBrowserTab = null;
 const viewModes = { schema: "tree" }; // per-card view toggles
@@ -7292,7 +7292,7 @@ function showState(kind, { title, sub, iconKey } = {}) {
 function showLoading() {
   panelState = "loading";
   lastRenderedTabId = null; // fresh audit lands at the top
-  secOpen = {}; // new page: let health defaults decide which sections auto-open
+  secOpen = {}; // new page: forget remembered open/closed state (all start collapsed)
   els.content.textContent = "";
   const wrap = h(
     "div",

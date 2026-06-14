@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "SEOdin — the Norse god of ranking",
-  "version": "1.8.1",
-  "description": "A macOS-style side panel that audits the on-page SEO of the active tab: schema, headings, links, images, social, performance and more.",
+  "version": "1.8.2",
+  "description": "A side panel that audits the on-page SEO of the active tab: schema, headings, links, images, social, performance and more.",
   "minimum_chrome_version": "114",
   "permissions": ["sidePanel", "activeTab", "scripting", "tabs", "storage"],
   "host_permissions": ["<all_urls>"],
