@@ -4,3 +4,6 @@
 # OS noise
 Thumbs.db
 .DS_Store
+
+# live session state, never public
+HANDOFF.md
